@@ -1,0 +1,15 @@
+[package]
+name = "px-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pxproxy-cli"
+path = "src/main.rs"
+
+[dependencies]
+px-proxy = { version = "0.1.0", path = "../px-proxy" }
+px-store = { version = "0.1.0", path = "../px-store" }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "signal"] }
+toml = "1.1.6"
+tracing-subscriber = "0.3.23"
