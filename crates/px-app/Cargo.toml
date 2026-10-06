@@ -1,0 +1,33 @@
+[package]
+name = "px-app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pxproxy"
+path = "src/main.rs"
+
+[dependencies]
+brotli-decompressor = "6.0.1"
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+egui = "0.36.2"
+egui_extras = { version = "0.36.2", features = ["image", "gif", "webp", "svg"] }
+flate2 = "1.1.10"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+parking_lot = "0.12.5"
+px-proxy = { version = "0.1.0", path = "../px-proxy" }
+px-store = { version = "0.1.0", path = "../px-store" }
+rfd = "0.17.2"
+skrifa = "0.44"
+tokio = { version = "1.53.2", features = ["rt-multi-thread"] }
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+zstd = "0.14.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+
+[dev-dependencies]
+brotli = "9.0.0"
+egui_kittest = "0.36.2"
