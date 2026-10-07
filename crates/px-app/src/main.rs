@@ -43,7 +43,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0])
             .with_min_inner_size([800.0, 500.0])
             .with_maximized(true)
-            .with_title("pxproxy"),
+            .with_title("pxproxy")
+            .with_icon(window_icon()),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
@@ -56,6 +57,13 @@ fn main() -> eframe::Result {
             Ok(Box::new(app::PxApp::new(cc.egui_ctx.clone(), opts)?))
         }),
     )
+}
+
+/// ウィンドウ（タイトルバー・タスクバー）のアイコン。
+fn window_icon() -> egui::IconData {
+    let img = image::load_from_memory(include_bytes!("../assets/icon-256.png")).expect("同梱アイコンの読み込みに失敗").into_rgba8();
+    let (width, height) = img.dimensions();
+    egui::IconData { rgba: img.into_raw(), width, height }
 }
 
 /// リリースビルドは GUI サブシステムなので、起動元のコンソールに出力をつなぐ（--help 等の表示用）。
