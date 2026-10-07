@@ -15,6 +15,7 @@ use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 
 use crate::http1::{BodyKind, Conn, RequestHead, rebuild_message, rewrite_target};
 use crate::intercept::{Decision, Direction, Held};
+use crate::limit::{Limited, Limiter};
 use crate::{ProxyContext, ProxyError, Result};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -245,7 +246,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 pub(crate) type Upstream = Conn<Box<dyn Io>>;
 
 /// TCP の接続先だけ hosts の設定で差し替える（SNI・証明書の検証は元のホスト名で行う）。
+/// 接続の制限（同時接続数・頻度）に掛かる間はここで待つ。
 pub(crate) async fn connect(ctx: &ProxyContext, t: &Target) -> Result<Upstream> {
+    // 待っている間に設定が変わることがあるので、毎回読み直す
+    let permit = Limiter::acquire(&ctx.limiter, || ctx.interceptor.rules().settings.limits).await;
     let pinned = ctx.interceptor.rules().resolve(&t.host);
     let via = pinned.map(|ip| format!(" (hosts: {ip})")).unwrap_or_default();
     let dial = async {
@@ -275,6 +279,8 @@ pub(crate) async fn connect(ctx: &ProxyContext, t: &Target) -> Result<Upstream> 
         .await
         .map_err(|_| ProxyError::Upstream(format!("connect timeout {}:{}{via}", t.host, t.port)))??;
     let _ = tcp.set_nodelay(true);
+    // 接続を閉じるまで同時接続数の枠を持つ
+    let tcp = Limited { inner: tcp, _permit: permit };
     let io: Box<dyn Io> = match t.scheme {
         Scheme::Http => Box::new(tcp),
         Scheme::Https => {
@@ -303,7 +309,7 @@ where
     loop {
         let head = match pending.take() {
             Some(h) => h,
-            None => match client.read_request_head().await? {
+            None => match read_next_request(&mut client, &mut upstream, ctx).await? {
                 Some(h) => h,
                 None => return Ok(()),
             },
@@ -387,6 +393,8 @@ where
         let res_head = loop {
             let reused = matches!(&upstream, Some((t, _)) if *t == target);
             if !reused {
+                // 別の宛先への接続は先に閉じる（同時接続数の上限に自分で掛からないように）
+                drop(upstream.take());
                 match connect(ctx, &target).await {
                     Ok(c) => upstream = Some((target.clone(), c)),
                     Err(e) => {
@@ -539,6 +547,23 @@ where
             return Ok(());
         }
     }
+}
+
+/// クライアントの次のリクエストを待つ。その間に接続の空き待ちが出たら、
+/// 使っていない上流接続を閉じて枠を譲る。
+async fn read_next_request<S: AsyncRead + Unpin>(
+    client: &mut Conn<S>,
+    upstream: &mut Option<(Target, Upstream)>,
+    ctx: &ProxyContext,
+) -> Result<Option<RequestHead>> {
+    if upstream.is_some() {
+        // read_request_head は読んだ分を client.buf に残すので、途中で打ち切っても取りこぼさない
+        tokio::select! {
+            head = client.read_request_head() => return head,
+            _ = ctx.limiter.idle_wanted() => *upstream = None,
+        }
+    }
+    client.read_request_head().await
 }
 
 pub(crate) fn new_flow(

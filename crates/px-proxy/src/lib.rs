@@ -3,6 +3,7 @@
 pub mod ca;
 pub mod http1;
 pub mod intercept;
+mod limit;
 mod repeater;
 pub mod rules;
 mod server;
@@ -18,7 +19,7 @@ use thiserror::Error;
 pub use ca::CertAuthority;
 pub use intercept::{Decision, Direction, Held, Interceptor};
 pub use repeater::{Origin, RepeatRequest};
-pub use rules::{HostEntry, InterceptRules, ProjectSettings, Scope, ScopeRule, parse_hosts};
+pub use rules::{ConnectionLimits, HostEntry, InterceptRules, ProjectSettings, Scope, ScopeRule, parse_hosts};
 pub use server::ProxyServer;
 
 #[derive(Debug, Error)]
@@ -53,6 +54,7 @@ pub struct ProxyContext {
     sink: RwLock<Option<FlowSink>>,
     observer: RwLock<Option<FlowObserver>>,
     interceptor: Interceptor,
+    limiter: Arc<limit::Limiter>,
     /// 待ち受け中のアドレス（上流が自分自身に向いていないかの判定に使う）
     listeners: RwLock<Vec<SocketAddr>>,
 }
@@ -65,6 +67,7 @@ impl ProxyContext {
             sink: RwLock::new(None),
             observer: RwLock::new(None),
             interceptor: Interceptor::default(),
+            limiter: Arc::default(),
             listeners: RwLock::new(Vec::new()),
         }))
     }

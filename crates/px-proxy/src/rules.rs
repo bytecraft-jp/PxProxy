@@ -1,4 +1,4 @@
-//! 案件ごとの設定（Scope / Intercept ルール / hosts）とその判定。
+//! 案件ごとの設定（Scope / Intercept ルール / hosts / 接続の制限）とその判定。
 //! 設定は案件フォルダの settings.toml に保存される（保存は UI 側）。
 
 use std::net::IpAddr;
@@ -97,6 +97,17 @@ pub struct ProjectSettings {
     pub intercept: InterceptRules,
     /// hosts ファイルと同じ書式の名前解決の上書き（`IP ホスト名…`、`#` 以降はコメント）
     pub hosts: String,
+    pub limits: ConnectionLimits,
+}
+
+/// 上流への接続の制限（ルータの IP フラッド検出などに引っ掛からないようにする）。0 は無制限。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectionLimits {
+    /// 同時に開いておく上流接続の上限
+    pub max_connections: u32,
+    /// 1 秒あたりに新しく張る上流接続の上限（等間隔に出す）
+    pub max_new_per_sec: u32,
 }
 
 /// hosts の 1 エントリ。`host` は小文字化したワイルドカード（`*` / `?`）。
