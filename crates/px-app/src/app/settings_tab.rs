@@ -1,4 +1,4 @@
-//! 設定タブ（診断対象 / Intercept ルール / hosts）と settings.toml の読み書き。
+//! 設定タブ（診断対象 / Intercept ルール / hosts / 接続の制限）と settings.toml の読み書き。
 
 use egui::RichText;
 use px_proxy::{ProjectSettings, ScopeRule};
@@ -138,6 +138,25 @@ impl PxApp {
             for e in px_proxy::parse_hosts(&s.hosts).1 {
                 ui.colored_label(RED, e);
             }
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.heading("接続の制限");
+            ui.label(
+                RichText::new(
+                    "ルータの IP フラッド検出などに引っ掛かる場合に、接続先への接続を抑えます（0 は無制限）。上限に達した通信は空きが出るまで待ち、待っている通信があれば keep-alive で使っていない接続から閉じます。Repeater の送信にも適用されます。",
+                )
+                .weak(),
+            );
+            let l = &mut s.limits;
+            egui::Grid::new("limits").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                ui.label("同時接続数の上限");
+                ui.add(egui::DragValue::new(&mut l.max_connections).range(0..=1000).suffix(" 本"));
+                ui.end_row();
+                ui.label("新規接続の上限");
+                ui.add(egui::DragValue::new(&mut l.max_new_per_sec).range(0..=1000).prefix("1 秒あたり ").suffix(" 本"));
+                ui.end_row();
+            });
             ui.add_space(12.0);
             if ui.button("既定値に戻す").clicked() {
                 s = ProjectSettings::default();

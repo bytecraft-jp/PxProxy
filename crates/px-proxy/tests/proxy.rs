@@ -427,3 +427,33 @@ async fn upstream_pointing_back_to_proxy_is_refused() {
         assert!(body.contains("pxproxy 自身"), "{host}: {body}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_limit_reclaims_idle_upstream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ca = Arc::new(CertAuthority::load_or_create(tmp.path().join("ca")).unwrap());
+    let ctx = ProxyContext::new(ca).unwrap();
+    let limits = px_proxy::ConnectionLimits { max_connections: 1, max_new_per_sec: 0 };
+    ctx.interceptor().set_settings(px_proxy::ProjectSettings { limits, ..Default::default() });
+    let proxy = ProxyServer::bind("127.0.0.1:0".parse().unwrap(), ctx).await.unwrap();
+    let up = upstream(None).await;
+
+    // 1 本目は keep-alive のまま上流接続を持ち続ける
+    let mut a = Conn::new(TcpStream::connect(proxy.local_addr()).await.unwrap());
+    let (st, _) = roundtrip(&mut a, &format!("GET http://127.0.0.1:{up}/a HTTP/1.1
+Host: 127.0.0.1:{up}
+
+")).await;
+    assert_eq!(st, 200);
+    // 2 本目は、1 本目の使っていない上流接続が閉じられて枠が空くので通る
+    let mut b = Conn::new(TcpStream::connect(proxy.local_addr()).await.unwrap());
+    let req = format!("GET http://127.0.0.1:{up}/b HTTP/1.1
+Host: 127.0.0.1:{up}
+
+");
+    let (st, body) = tokio::time::timeout(Duration::from_secs(5), roundtrip(&mut b, &req)).await.expect("枠が空かない");
+    assert_eq!((st, body.as_slice()), (200, &b"GET /b body="[..]));
+    // 1 本目も引き続き使える（上流は張り直す）
+    let (st, _) = tokio::time::timeout(Duration::from_secs(5), roundtrip(&mut a, &req)).await.expect("1 本目が詰まった");
+    assert_eq!(st, 200);
+}
