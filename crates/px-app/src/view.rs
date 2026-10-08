@@ -2,12 +2,13 @@
 //! JSON / HTML / XML の整形）。
 
 use std::fmt::Write;
-use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+pub(crate) use px_store::decode_content;
+use time::{OffsetDateTime, UtcOffset};
 
 const MAX_TEXT: usize = 512 * 1024;
 const MAX_HEX: usize = 64 * 1024;
-const MAX_DECOMPRESSED: u64 = 32 * 1024 * 1024;
 /// これより大きい Body は整形しない
 const MAX_PRETTY_INPUT: usize = 8 * 1024 * 1024;
 /// 整形結果の表示上限
@@ -390,36 +391,6 @@ pub(crate) fn find_ascii_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w.eq_ignore_ascii_case(needle))
 }
 
-/// `Content-Encoding: gzip, br` のような複数指定は適用の逆順に展開する。
-/// 何もしなければ Ok(None)。
-pub(crate) fn decode_content(encoding: &str, body: &[u8]) -> Result<Option<Vec<u8>>, String> {
-    let codings: Vec<&str> =
-        encoding.split(',').map(str::trim).filter(|c| !c.is_empty() && *c != "identity").collect();
-    if codings.is_empty() {
-        return Ok(None);
-    }
-    let mut data = body.to_vec();
-    for coding in codings.iter().rev() {
-        let src = data.as_slice();
-        data = match *coding {
-            "gzip" | "x-gzip" => decompress(flate2::read::MultiGzDecoder::new(src)),
-            "deflate" => decompress(flate2::read::ZlibDecoder::new(src))
-                .or_else(|_| decompress(flate2::read::DeflateDecoder::new(src))),
-            "br" => decompress(brotli_decompressor::Decompressor::new(src, 64 * 1024)),
-            "zstd" => zstd::stream::read::Decoder::new(src).map_err(|e| e.to_string()).and_then(decompress),
-            other => return Err(format!("Content-Encoding: {other} は未対応")),
-        }
-        .map_err(|e| format!("Content-Encoding: {coding} の展開に失敗 ({e})"))?;
-    }
-    Ok(Some(data))
-}
-
-fn decompress(reader: impl Read) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    reader.take(MAX_DECOMPRESSED).read_to_end(&mut out).map_err(|e| e.to_string())?;
-    Ok(out)
-}
-
 /// Content-Type とマジックバイトから画像を判定する。
 fn image_preview(content_type: &str, body: &[u8], uri_key: &str) -> Option<ImagePreview> {
     let sniffed = image::guess_format(body).ok().and_then(|f| match f {
@@ -483,6 +454,47 @@ pub(crate) fn hexdump(out: &mut String, data: &[u8]) {
         out.extend(chunk.iter().map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' }));
         out.push_str("|\n");
     }
+}
+
+static LOCAL_OFFSET: OnceLock<UtcOffset> = OnceLock::new();
+
+/// ローカルのタイムゾーンを読んでおく。OS によっては複数スレッドになる前でないと読めないので、起動直後に呼ぶ。
+pub fn init_local_offset() {
+    let _ = LOCAL_OFFSET.set(UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC));
+}
+
+fn local(us: i64) -> OffsetDateTime {
+    let offset = *LOCAL_OFFSET.get_or_init(|| UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC));
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(us) * 1000)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        .to_offset(offset)
+}
+
+/// `2026-10-08 12:34:56.789`（ローカル時刻）
+pub fn format_datetime(us: i64) -> String {
+    let t = local(us);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        t.year(),
+        t.month() as u8,
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond()
+    )
+}
+
+/// 一覧用の短い表記 `10-08 12:34:56`
+pub fn format_time_short(us: i64) -> String {
+    let t = local(us);
+    format!("{:02}-{:02} {:02}:{:02}:{:02}", t.month() as u8, t.day(), t.hour(), t.minute(), t.second())
+}
+
+/// 時刻だけ `12:34:56.789`
+pub fn format_clock(us: i64) -> String {
+    let t = local(us);
+    format!("{:02}:{:02}:{:02}.{:03}", t.hour(), t.minute(), t.second(), t.millisecond())
 }
 
 pub fn human_size(n: i64) -> String {
@@ -598,6 +610,15 @@ mod tests {
         // 既に整形済みなら整形表示は出さない
         let r = render_message(b"HTTP/1.1 200 OK\r\n\r\n", b"[]", "t");
         assert!(r.pretty.is_none());
+    }
+
+    #[test]
+    fn datetime_format() {
+        let _ = LOCAL_OFFSET.set(UtcOffset::UTC);
+        let us = 1_791_455_696_789_000; // 2026-10-08 10:34:56.789 UTC
+        assert_eq!(format_datetime(us), "2026-10-08 10:34:56.789");
+        assert_eq!(format_time_short(us), "10-08 10:34:56");
+        assert_eq!(format_clock(us), "10:34:56.789");
     }
 
     #[test]

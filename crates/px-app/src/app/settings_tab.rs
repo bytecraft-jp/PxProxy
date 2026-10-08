@@ -1,4 +1,5 @@
-//! 設定タブ（診断対象 / Intercept ルール / hosts / 接続の制限）と settings.toml の読み書き。
+//! 設定タブ（診断対象 / Intercept ルール / hosts / 接続の制限 / 上流プロキシ / TLS パススルー / 記録）と
+//! settings.toml の読み書き。
 
 use egui::RichText;
 use px_proxy::{ProjectSettings, ScopeRule};
@@ -33,6 +34,11 @@ impl PxApp {
         if self.filter.in_scope_only {
             self.reset_list();
         }
+        if self.site_map.in_scope_only {
+            self.site_map.reset();
+            self.reset_list();
+        }
+        self.findings.dirty = true;
     }
 
     pub(super) fn apply_settings(&mut self, settings: ProjectSettings) {
@@ -60,6 +66,20 @@ impl PxApp {
         }
         self.apply_settings(s);
         self.status = format!("{host} を診断対象{}", if exclude { "から除外しました" } else { "に追加しました" });
+    }
+
+    /// History の右クリックから TLS パススルーにホストを追加する。
+    pub(super) fn add_passthrough_host(&mut self, host: &str) {
+        let mut s = self.settings.clone();
+        if !px_proxy::parse_host_list(&s.tls_passthrough).iter().any(|h| h.eq_ignore_ascii_case(host)) {
+            if !s.tls_passthrough.is_empty() && !s.tls_passthrough.ends_with('\n') {
+                s.tls_passthrough.push('\n');
+            }
+            s.tls_passthrough.push_str(host);
+            s.tls_passthrough.push('\n');
+        }
+        self.apply_settings(s);
+        self.status = format!("{host} を TLS パススルーに追加しました（新しい接続から復号せずに中継します）");
     }
 
     pub(super) fn settings_tab(&mut self, ui: &mut egui::Ui) {
@@ -157,6 +177,78 @@ impl PxApp {
                 ui.add(egui::DragValue::new(&mut l.max_new_per_sec).range(0..=1000).prefix("1 秒あたり ").suffix(" 本"));
                 ui.end_row();
             });
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.heading("上流プロキシ");
+            ui.label(
+                RichText::new(
+                    "社内プロキシなどを経由して接続先へつなぎます。HTTPS は CONNECT、平文 HTTP は absolute-form で送ります。Repeater の送信と TLS パススルーにも適用されます。",
+                )
+                .weak(),
+            );
+            let u = &mut s.upstream;
+            ui.checkbox(&mut u.enabled, "上流プロキシを使う");
+            ui.add_enabled_ui(u.enabled, |ui| {
+                egui::Grid::new("upstream").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                    let h = ui.spacing().interact_size.y;
+                    ui.label("アドレス");
+                    ui.add_sized([280.0, h], egui::TextEdit::singleline(&mut u.address).hint_text("proxy.example.com:8080"));
+                    ui.end_row();
+                    ui.label("ユーザー名");
+                    ui.add_sized([280.0, h], egui::TextEdit::singleline(&mut u.username).hint_text("空なら認証しない"));
+                    ui.end_row();
+                    ui.label("パスワード");
+                    ui.add_sized([280.0, h], egui::TextEdit::singleline(&mut u.password).password(true));
+                    ui.end_row();
+                });
+                ui.label("上流プロキシを通さずに直接つなぐホスト（空白・改行区切り、* と ? のワイルドカード、# 以降はコメント）");
+                ui.add(
+                    egui::TextEdit::multiline(&mut u.bypass)
+                        .hint_text("localhost 127.0.0.1\n*.internal.example.com")
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace),
+                );
+            });
+            if let Err(e) = u.parse() {
+                ui.colored_label(RED, format!("{e}（直接つなぎます）"));
+            }
+            ui.label(
+                RichText::new("認証情報は settings.toml に平文で保存され、zip エクスポートにも含まれます。").small().weak(),
+            );
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.heading("TLS パススルー（復号しないホスト）");
+            ui.label(
+                RichText::new(
+                    "ここに書いたホストの HTTPS は復号せず、そのまま中継します。証明書ピンニングで失敗するアプリや、OS の更新など診断対象外の通信に使います。CONNECT のホスト名か SNI が一致すれば対象です（空白・改行区切り、* と ? のワイルドカード、# 以降はコメント）。History には接続の記録だけが残ります。",
+                )
+                .weak(),
+            );
+            ui.add(
+                egui::TextEdit::multiline(&mut s.tls_passthrough)
+                    .hint_text("*.apple.com\nupdate.example.com")
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace),
+            );
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.heading("記録");
+            ui.label(
+                RichText::new(
+                    "Body がこの大きさを超えた通信は、転送はそのまま行い、記録は先頭だけにします（メモリと案件フォルダの容量を抑えます）。WebSocket のメッセージにも 1 件ごとに適用されます。Intercept で止めた通信は全体を記録します。",
+                )
+                .weak(),
+            );
+            ui.horizontal(|ui| {
+                ui.label("記録する Body の上限");
+                ui.add(egui::DragValue::new(&mut s.max_record_body_mb).range(1..=1024).suffix(" MB"));
+            });
+
             ui.add_space(12.0);
             if ui.button("既定値に戻す").clicked() {
                 s = ProjectSettings::default();

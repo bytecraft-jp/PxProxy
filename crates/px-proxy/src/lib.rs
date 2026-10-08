@@ -8,18 +8,22 @@ mod repeater;
 pub mod rules;
 mod server;
 mod tls;
+mod ws;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use px_store::FlowSink;
+use px_store::{FlowSink, NewFlow};
 use thiserror::Error;
 
 pub use ca::CertAuthority;
 pub use intercept::{Decision, Direction, Held, Interceptor};
 pub use repeater::{Origin, RepeatRequest};
-pub use rules::{ConnectionLimits, HostEntry, InterceptRules, ProjectSettings, Scope, ScopeRule, parse_hosts};
+pub use rules::{
+    ConnectionLimits, DEFAULT_MAX_RECORD_BODY_MB, HostEntry, InterceptRules, ProjectSettings, Scope, ScopeRule,
+    UpstreamProxy, parse_host_list, parse_hosts,
+};
 pub use server::ProxyServer;
 
 #[derive(Debug, Error)]
@@ -100,12 +104,23 @@ impl ProxyContext {
         *self.observer.write() = observer;
     }
 
-    fn submit(&self, flow: px_store::NewFlow) {
+    fn submit(&self, flow: NewFlow) {
         if let Some(o) = self.observer.read().as_ref() {
             o(&flow);
         }
         if let Some(s) = self.sink.read().as_ref() {
             s.submit(flow);
         }
+    }
+
+    /// 記録して、続けて同じ案件へ書き込むための sink と記録した ID を返す（WebSocket のメッセージ用）。
+    /// 案件を切り替えても、接続が続く間は元の案件に書く。
+    fn submit_with_sink(&self, flow: NewFlow) -> Option<(FlowSink, i64)> {
+        if let Some(o) = self.observer.read().as_ref() {
+            o(&flow);
+        }
+        let sink = self.sink.read().clone()?;
+        let id = sink.submit(flow);
+        Some((sink, id))
     }
 }

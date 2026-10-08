@@ -3,6 +3,7 @@
 mod app;
 mod cli;
 mod codec;
+mod diff;
 mod fonts;
 mod highlight;
 mod view;
@@ -28,6 +29,9 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         }
     };
+
+    // スレッドを増やす前にタイムゾーンを読む（一覧の時刻表示用）
+    view::init_local_offset();
 
     use tracing_subscriber::prelude::*;
     // 自前クレートはデバッグビルドで debug まで出す（接続の異常終了理由など）

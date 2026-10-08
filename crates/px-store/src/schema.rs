@@ -3,7 +3,7 @@ use rusqlite::{Connection, params};
 use crate::Result;
 use crate::classify::{classify, content_type};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// 接続設定。journal_mode の変更は書き込み接続でのみ行う。
 pub fn tune(conn: &Connection, writable: bool) -> Result<()> {
@@ -43,6 +43,52 @@ pub fn migrate(conn: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 4 {
+        // v4: Body の切り詰め、WebSocket のメッセージ、パッシブチェックの検出。
+        // 既存のフローは meta.passive_upto = 0 から writer が順に調べる。
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE flows ADD COLUMN truncated INTEGER NOT NULL DEFAULT 0;
+             CREATE TABLE IF NOT EXISTS ws_messages(
+                 id          INTEGER PRIMARY KEY,
+                 flow_id     INTEGER NOT NULL,
+                 at_us       INTEGER NOT NULL,
+                 from_client INTEGER NOT NULL,
+                 opcode      INTEGER NOT NULL,
+                 len         INTEGER NOT NULL,   -- 実際の長さ（data は切り詰めることがある）
+                 data        BLOB
+             );
+             CREATE INDEX IF NOT EXISTS ws_flow ON ws_messages(flow_id, id);
+             CREATE TABLE IF NOT EXISTS findings(
+                 id       INTEGER PRIMARY KEY,
+                 flow_id  INTEGER NOT NULL,
+                 check_id TEXT NOT NULL,
+                 severity INTEGER NOT NULL,
+                 detail   TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS findings_flow ON findings(flow_id);
+             CREATE INDEX IF NOT EXISTS findings_check ON findings(check_id, flow_id);
+             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID;
+             PRAGMA user_version = 4;
+             COMMIT;",
+        )?;
+    }
+    Ok(())
+}
+
+/// meta テーブルの整数値（無ければ 0）。
+pub fn meta_get(conn: &Connection, key: &str) -> Result<i64> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .prepare_cached("SELECT value FROM meta WHERE key = ?1")?
+        .query_row([key], |r| r.get(0))
+        .optional()?
+        .unwrap_or(0))
+}
+
+pub fn meta_set(conn: &Connection, key: &str, value: i64) -> Result<()> {
+    conn.prepare_cached("INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2")?
+        .execute(params![key, value])?;
     Ok(())
 }
 

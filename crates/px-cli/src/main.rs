@@ -63,12 +63,17 @@ fn run(dir: &Path, listen: std::net::SocketAddr, create: bool, quiet: bool) -> R
     };
     let ca = Arc::new(CertAuthority::load_or_create(CertAuthority::default_dir())?);
     let ctx = ProxyContext::new(ca)?;
-    // hosts の上書きを効かせるため案件の設定を読む（Intercept は CLI では使わない）
+    // hosts・上流プロキシ・TLS パススルー・記録の上限を効かせるため案件の設定を読む（Intercept は CLI では使わない）
     if let Ok(text) = std::fs::read_to_string(project.settings_path()) {
         let settings: ProjectSettings =
             toml::from_str(&text).map_err(|e| format!("settings.toml を読めません: {e}"))?;
         for e in px_proxy::parse_hosts(&settings.hosts).1 {
             eprintln!("警告: hosts {e}");
+        }
+        match settings.upstream.parse() {
+            Ok(Some(p)) => eprintln!("  上流プロキシ: {}:{}", p.host, p.port),
+            Ok(None) => {}
+            Err(e) => eprintln!("警告: {e}（上流プロキシを使わずに直接つなぎます）"),
         }
         let _ = ctx.interceptor().set_settings(settings);
     }
@@ -111,7 +116,7 @@ fn log_line(f: &NewFlow) -> String {
         f.scheme,
         f.target,
         f.duration_us / 1000,
-        human_size(f.res_body.len())
+        human_size(f.res_body_total.map_or(f.res_body.len(), |n| n as usize))
     );
     if let Some(e) = &f.error {
         line.push_str(&format!("  [{e}]"));

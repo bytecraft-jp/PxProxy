@@ -18,6 +18,8 @@ fn flow(host: &str, body: Vec<u8>) -> NewFlow {
         error: None,
         orig_request: None,
         orig_response: None,
+        req_body_total: None,
+        res_body_total: None,
     }
 }
 
@@ -146,4 +148,111 @@ fn notes_are_saved_cleared_and_kept_after_reopen() {
     let reader = project.reader().unwrap();
     assert_eq!(reader.summary(1).unwrap().unwrap().note.as_deref(), Some("ログイン後のトークン"));
     assert_eq!(reader.summary(2).unwrap().unwrap().note, None);
+}
+
+fn wait_for(reader: &px_store::Reader, n: i64) {
+    for _ in 0..200 {
+        if reader.count().unwrap() >= n && reader.passive_progress().unwrap().0 >= n {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("記録が {n} 件になりません");
+}
+
+#[test]
+fn ids_websocket_and_truncation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("w.pxproj");
+    let project = Project::create(&dir, None).unwrap();
+    let sink = project.sink();
+    assert_eq!(sink.submit(flow("a.test", Vec::new())), 1, "submit が記録される ID を返す");
+    let mut big = flow("a.test", b"head".to_vec());
+    big.res_body_total = Some(10_000);
+    let ws_flow = sink.submit(big);
+    assert_eq!(ws_flow, 2);
+    for (i, text) in ["hello", "world"].iter().enumerate() {
+        sink.submit_ws(px_store::WsMessage {
+            id: 0,
+            flow_id: ws_flow,
+            at_us: i as i64,
+            from_client: i == 0,
+            opcode: px_store::WsMessage::TEXT,
+            len: text.len() as u64,
+            data: text.as_bytes().to_vec(),
+        });
+    }
+    drop(sink);
+    project.close();
+
+    // 開き直しても ID は続きから振る
+    let project = Project::open(&dir, None).unwrap();
+    assert_eq!(project.sink().submit(flow("b.test", Vec::new())), 3);
+    let reader = project.reader().unwrap();
+    wait_for(&reader, 3);
+    let s = reader.summary(2).unwrap().unwrap();
+    assert_eq!((s.res_body_len, s.truncated), (10_000, px_store::TRUNCATED_RESPONSE));
+    let msgs = reader.ws_messages(ws_flow, 0).unwrap();
+    assert_eq!(msgs.iter().map(|m| (m.from_client, m.data.as_slice())).collect::<Vec<_>>(), [(true, &b"hello"[..]), (false, b"world")]);
+    assert_eq!(reader.ws_messages(ws_flow, msgs[0].id).unwrap().len(), 1, "差分だけ取れる");
+}
+
+#[test]
+fn site_filter_matches_path_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = Project::create(tmp.path().join("s.pxproj"), None).unwrap();
+    let sink = project.sink();
+    for target in ["/a", "/a/b?x=1", "/a?q", "/ab", "/", "/a/"] {
+        let mut f = flow("example.com", Vec::new());
+        f.target = target.into();
+        sink.submit(f);
+    }
+    let mut other = flow("example.com", Vec::new());
+    other.port = 8443;
+    sink.submit(other);
+    let reader = project.reader().unwrap();
+    wait_for(&reader, 7);
+    let site = |path: &str| {
+        let f = Filter {
+            site: Some(px_store::SiteFilter { scheme: "https".into(), host: "example.com".into(), port: 443, path: path.into() }),
+            ..Default::default()
+        };
+        reader.ids_after(0, &f).unwrap()
+    };
+    assert_eq!(site(""), [1, 2, 3, 4, 5, 6], "ホスト全体（別ポートは含めない）");
+    assert_eq!(site("/a"), [1, 2, 3, 6], "/ab は含めない");
+    assert_eq!(site("/a/b"), [2]);
+    assert_eq!(reader.site_rows_after(5, false).unwrap().len(), 2);
+}
+
+#[test]
+fn passive_findings_are_recorded_and_rescanned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = Project::create(tmp.path().join("p.pxproj"), None).unwrap();
+    let sink = project.sink();
+    let mut f = flow("example.com", b"<html>Traceback (most recent call last):</html>".to_vec());
+    f.res_head = Some(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: SID=1; Secure; HttpOnly\r\n\r\n".to_vec());
+    sink.submit(f);
+    sink.submit(flow("example.org", Vec::new()));
+    let reader = project.reader().unwrap();
+    wait_for(&reader, 2);
+    let found = reader.findings_of(1).unwrap();
+    let ids: Vec<&str> = found.iter().map(|f| f.check.as_str()).collect();
+    assert!(ids.contains(&"error-message") && ids.contains(&"cookie-no-samesite"), "{ids:?}");
+    assert_eq!(found[0].severity, px_store::Severity::Low, "重い順");
+    assert_eq!(reader.summary(1).unwrap().unwrap().max_severity, Some(px_store::Severity::Low));
+    assert_eq!(reader.summary(2).unwrap().unwrap().max_severity, None);
+    let groups = reader.finding_groups(false).unwrap();
+    assert!(groups.iter().all(|g| g.host == "example.com" && g.flows == 1));
+    assert_eq!(reader.findings_in("error-message", "example.com").unwrap().len(), 1);
+
+    let before = groups.len();
+    sink.rescan_passive();
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        if reader.passive_progress().unwrap() == (2, 2) && reader.finding_groups(false).unwrap().len() == before {
+            return;
+        }
+    }
+    panic!("再スキャンが終わりません: {:?}", reader.passive_progress().unwrap());
 }
