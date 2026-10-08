@@ -75,7 +75,7 @@ impl Project {
         fs::create_dir_all(dir.join(BODIES_DIR))?;
         let conn = open_conn(&dir.join(DB_FILE))?;
         schema::migrate(&conn)?;
-        let writer = Writer::spawn(conn, dir.join(BODIES_DIR), on_commit);
+        let writer = Writer::spawn(conn, dir.join(BODIES_DIR), on_commit)?;
         Ok(Self { dir, manifest, writer })
     }
 

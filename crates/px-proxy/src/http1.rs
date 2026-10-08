@@ -4,7 +4,7 @@
 use std::io;
 
 use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{ProxyError, Result};
 
@@ -109,6 +109,65 @@ pub struct Body {
 impl Body {
     pub fn decoded(&self) -> &[u8] {
         self.decoded.as_deref().unwrap_or(&self.raw)
+    }
+}
+
+/// `relay_body` の結果。途中で失敗しても、それまでに読んだ分は残る。
+#[derive(Debug)]
+pub struct Relayed {
+    /// 枠を外した Body の先頭（記録の上限まで）
+    pub data: Vec<u8>,
+    /// 枠を外した Body の実際の長さ
+    pub total: u64,
+    pub error: Option<RelayError>,
+}
+
+impl Relayed {
+    /// 上限で切り詰めたか
+    pub fn truncated(&self) -> bool {
+        self.total > self.data.len() as u64
+    }
+}
+
+#[derive(Debug)]
+pub enum RelayError {
+    /// 読み取り側（送り元）の失敗
+    Read(ProxyError),
+    /// 書き込み側（送り先）の失敗
+    Write(io::Error),
+}
+
+/// 読んだ分を送り先に流しつつ、記録用に先頭だけ残す。
+struct Relay<'a, W> {
+    out: &'a mut W,
+    /// まだ送り先に書いていないバイト列。読み取りで待つ前に書き出す（チャンクの枠を小分けに書かない）
+    pending: Vec<u8>,
+    data: Vec<u8>,
+    keep: usize,
+    total: u64,
+}
+
+impl<W: AsyncWrite + Unpin> Relay<'_, W> {
+    /// 回線上のバイト列（チャンクの枠など）をそのまま送る。
+    fn pass(&mut self, wire: &[u8]) {
+        self.pending.extend_from_slice(wire);
+    }
+
+    /// Body の中身を送り、記録用に残す。
+    fn body(&mut self, data: &[u8]) {
+        self.pending.extend_from_slice(data);
+        self.total += data.len() as u64;
+        let room = self.keep.saturating_sub(self.data.len());
+        self.data.extend_from_slice(&data[..data.len().min(room)]);
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        if !self.pending.is_empty() {
+            self.out.write_all(&self.pending).await?;
+            self.pending.clear();
+            self.out.flush().await?;
+        }
+        Ok(())
     }
 }
 
@@ -246,6 +305,97 @@ impl<S: AsyncRead + Unpin> Conn<S> {
             }
             if self.fill().await? == 0 {
                 return Err(eof("line"));
+            }
+        }
+    }
+
+    /// Body を読んだそばから `out` へ流す（全体をメモリに溜めない）。記録用に枠を外した先頭 `keep` バイトを返す。
+    /// 送り元は止まらずに読み続けるので、SSE のような終わらない応答もそのまま届く。
+    pub async fn relay_body<W: AsyncWrite + Unpin>(&mut self, kind: BodyKind, out: &mut W, keep: usize) -> Relayed {
+        let mut r = Relay { out, pending: Vec::new(), data: Vec::new(), keep, total: 0 };
+        let error = match self.relay_inner(kind, &mut r).await {
+            Ok(()) => r.flush().await.err().map(RelayError::Write),
+            Err(e) => Some(e),
+        };
+        Relayed { data: r.data, total: r.total, error }
+    }
+
+    async fn relay_inner<W: AsyncWrite + Unpin>(&mut self, kind: BodyKind, r: &mut Relay<'_, W>) -> std::result::Result<(), RelayError> {
+        match kind {
+            BodyKind::Empty => Ok(()),
+            BodyKind::Length(mut remaining) => {
+                while remaining > 0 {
+                    self.more(r, "body").await?;
+                    let n = (self.buf.len() as u64).min(remaining) as usize;
+                    let chunk = self.buf.split_to(n);
+                    r.body(&chunk);
+                    remaining -= n as u64;
+                }
+                Ok(())
+            }
+            BodyKind::UntilClose => loop {
+                if self.buf.is_empty() {
+                    r.flush().await.map_err(RelayError::Write)?;
+                    if self.fill().await.map_err(|e| RelayError::Read(e.into()))? == 0 {
+                        return Ok(());
+                    }
+                }
+                let chunk = self.buf.split();
+                r.body(&chunk);
+            },
+            BodyKind::Chunked => loop {
+                let line = self.relay_line(r).await?;
+                r.pass(&line);
+                let size_str = std::str::from_utf8(&line).unwrap_or("").split(';').next().unwrap_or("").trim();
+                let size = u64::from_str_radix(size_str, 16)
+                    .map_err(|_| RelayError::Read(ProxyError::Parse(format!("chunk size {size_str:?}"))))?;
+                if size == 0 {
+                    // trailer セクション: 空行まで
+                    loop {
+                        let t = self.relay_line(r).await?;
+                        r.pass(&t);
+                        if t == b"\r\n" || t == b"\n" {
+                            return Ok(());
+                        }
+                    }
+                }
+                let mut remaining = size;
+                while remaining > 0 {
+                    self.more(r, "chunk").await?;
+                    let n = (self.buf.len() as u64).min(remaining) as usize;
+                    let chunk = self.buf.split_to(n);
+                    r.body(&chunk);
+                    remaining -= n as u64;
+                }
+                let crlf = self.relay_line(r).await?;
+                r.pass(&crlf);
+            },
+        }
+    }
+
+    /// バッファが空なら、送り先へ書き出してから読み足す。読めなければ EOF のエラー。
+    async fn more<W: AsyncWrite + Unpin>(&mut self, r: &mut Relay<'_, W>, what: &str) -> std::result::Result<(), RelayError> {
+        if self.buf.is_empty() {
+            r.flush().await.map_err(RelayError::Write)?;
+            if self.fill().await.map_err(|e| RelayError::Read(e.into()))? == 0 {
+                return Err(RelayError::Read(eof(what)));
+            }
+        }
+        Ok(())
+    }
+
+    /// 改行（LF）までを改行込みで返す。待つ前に送り先へ書き出す。
+    async fn relay_line<W: AsyncWrite + Unpin>(&mut self, r: &mut Relay<'_, W>) -> std::result::Result<Vec<u8>, RelayError> {
+        loop {
+            if let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+                return Ok(self.buf.split_to(pos + 1).to_vec());
+            }
+            if self.buf.len() > MAX_HEAD_BYTES {
+                return Err(RelayError::Read(ProxyError::Parse("line too long".into())));
+            }
+            r.flush().await.map_err(RelayError::Write)?;
+            if self.fill().await.map_err(|e| RelayError::Read(e.into()))? == 0 {
+                return Err(RelayError::Read(eof("line")));
             }
         }
     }
@@ -394,6 +544,36 @@ mod tests {
         let raw = b"GET http://a.example/x?y HTTP/1.1\r\nHoSt: a.example\r\n\r\n";
         let out = rewrite_target(raw, "GET", "/x?y");
         assert_eq!(out, b"GET /x?y HTTP/1.1\r\nHoSt: a.example\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn relay_keeps_wire_bytes_and_records_head() {
+        let data: &[u8] = b"4;ext=1\r\nWiki\r\n5\r\npedia\r\n0\r\nX-T: 1\r\n\r\nNEXT";
+        let mut c = Conn::new(data);
+        let mut out = Vec::new();
+        let r = c.relay_body(BodyKind::Chunked, &mut out, 6).await;
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(out, &data[..data.len() - 4], "枠ごとそのまま流す");
+        assert_eq!((r.data.as_slice(), r.total, r.truncated()), (&b"Wikipe"[..], 9, true));
+        assert_eq!(&c.buf[..], b"NEXT");
+
+        let mut c = Conn::new(&b"abcdefXYZ"[..]);
+        let mut out = Vec::new();
+        let r = c.relay_body(BodyKind::Length(6), &mut out, 100).await;
+        assert_eq!((out.as_slice(), r.data.as_slice(), r.truncated()), (&b"abcdef"[..], &b"abcdef"[..], false));
+
+        // 途中で切れたら、それまでの分は送って Read エラー
+        let mut c = Conn::new(&b"abc"[..]);
+        let mut out = Vec::new();
+        let r = c.relay_body(BodyKind::Length(6), &mut out, 100).await;
+        assert!(matches!(r.error, Some(RelayError::Read(_))));
+        assert_eq!((out.as_slice(), r.total), (&b"abc"[..], 3));
+
+        let mut c = Conn::new(&b"until close"[..]);
+        let mut out = Vec::new();
+        let r = c.relay_body(BodyKind::UntilClose, &mut out, 5).await;
+        assert!(r.error.is_none());
+        assert_eq!((out.as_slice(), r.data.as_slice(), r.total), (&b"until close"[..], &b"until"[..], 11));
     }
 
     #[tokio::test]

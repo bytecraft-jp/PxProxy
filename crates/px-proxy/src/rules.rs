@@ -1,4 +1,4 @@
-//! 案件ごとの設定（Scope / Intercept ルール / hosts / 接続の制限）とその判定。
+//! 案件ごとの設定（Scope / Intercept ルール / hosts / 接続の制限 / 上流プロキシ / TLS パススルー）とその判定。
 //! 設定は案件フォルダの settings.toml に保存される（保存は UI 側）。
 
 use std::net::IpAddr;
@@ -90,7 +90,7 @@ impl Default for InterceptRules {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProjectSettings {
     pub scope: Scope,
@@ -98,6 +98,108 @@ pub struct ProjectSettings {
     /// hosts ファイルと同じ書式の名前解決の上書き（`IP ホスト名…`、`#` 以降はコメント）
     pub hosts: String,
     pub limits: ConnectionLimits,
+    pub upstream: UpstreamProxy,
+    /// TLS を復号せずにそのまま中継するホスト（空白・改行区切りのワイルドカード、`#` 以降はコメント）
+    pub tls_passthrough: String,
+    /// 記録する Body の上限（MB）。超えた分は記録せずに転送だけする
+    pub max_record_body_mb: u32,
+}
+
+impl Default for ProjectSettings {
+    fn default() -> Self {
+        Self {
+            scope: Scope::default(),
+            intercept: InterceptRules::default(),
+            hosts: String::new(),
+            limits: ConnectionLimits::default(),
+            upstream: UpstreamProxy::default(),
+            tls_passthrough: String::new(),
+            max_record_body_mb: DEFAULT_MAX_RECORD_BODY_MB,
+        }
+    }
+}
+
+pub const DEFAULT_MAX_RECORD_BODY_MB: u32 = 32;
+
+/// 上流プロキシ（社内プロキシなど）。HTTPS は CONNECT で、平文 HTTP は absolute-form で送る。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpstreamProxy {
+    pub enabled: bool,
+    /// `host:port`（`http://` は付けても付けなくてもよい）
+    pub address: String,
+    /// Basic 認証。空なら認証しない
+    pub username: String,
+    pub password: String,
+    /// 上流プロキシを通さず直接つなぐホスト（空白・改行区切りのワイルドカード、`#` 以降はコメント）
+    pub bypass: String,
+}
+
+impl Default for UpstreamProxy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            address: String::new(),
+            username: String::new(),
+            password: String::new(),
+            bypass: "localhost 127.0.0.1 ::1".into(),
+        }
+    }
+}
+
+/// 解析済みの上流プロキシ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyAddr {
+    pub host: String,
+    pub port: u16,
+    /// `Proxy-Authorization` の値（`Basic …`）
+    pub auth: Option<String>,
+}
+
+impl UpstreamProxy {
+    /// 有効なら解析した宛先。無効なら Ok(None)、書式が不正なら Err。
+    pub fn parse(&self) -> Result<Option<ProxyAddr>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let addr = self.address.trim();
+        let addr = addr.strip_prefix("http://").unwrap_or(addr).trim_end_matches('/');
+        if addr.is_empty() {
+            return Err("上流プロキシのアドレスを入力してください".into());
+        }
+        let (host, port) = match crate::server::parse_authority(addr, 0) {
+            Some((h, p)) if !h.is_empty() && p != 0 && !h.contains(['/', ' ', '@']) => (h, p),
+            _ => return Err(format!("上流プロキシのアドレスは host:port の形で指定してください: {addr}")),
+        };
+        let auth = (!self.username.is_empty())
+            .then(|| format!("Basic {}", base64(format!("{}:{}", self.username, self.password).as_bytes())));
+        Ok(Some(ProxyAddr { host, port, auth }))
+    }
+}
+
+/// 空白・改行・カンマ区切りのホストのワイルドカード一覧（`#` 以降はコメント、小文字化）。
+pub fn parse_host_list(text: &str) -> Vec<String> {
+    text.lines()
+        .flat_map(|l| l.split('#').next().unwrap_or("").split([' ', '\t', ',']))
+        .map(|w| w.trim().to_ascii_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+fn base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(TABLE[(n >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// 上流への接続の制限（ルータの IP フラッド検出などに引っ掛からないようにする）。0 は無制限。
@@ -144,10 +246,14 @@ pub struct CompiledRules {
     pub settings: ProjectSettings,
     url_regex: Option<Regex>,
     hosts: Vec<HostEntry>,
+    upstream: Option<ProxyAddr>,
+    bypass: Vec<String>,
+    passthrough: Vec<String>,
 }
 
 impl CompiledRules {
     /// 正規表現が不正ならエラーメッセージも返す（その条件は無視される）。
+    /// 上流プロキシの指定が不正なら上流プロキシは使わない（`UpstreamProxy::parse` で理由が分かる）。
     pub fn compile(settings: ProjectSettings) -> (Self, Option<String>) {
         let pattern = settings.intercept.url_regex.trim();
         let (url_regex, err) = if pattern.is_empty() {
@@ -159,7 +265,33 @@ impl CompiledRules {
             }
         };
         let hosts = parse_hosts(&settings.hosts).0;
-        (Self { settings, url_regex, hosts }, err)
+        let upstream = settings.upstream.parse().ok().flatten();
+        let bypass = parse_host_list(&settings.upstream.bypass);
+        let passthrough = parse_host_list(&settings.tls_passthrough);
+        (Self { settings, url_regex, hosts, upstream, bypass, passthrough }, err)
+    }
+
+    /// `host` へつなぐときに通す上流プロキシ。使わないなら None。
+    pub fn upstream_for(&self, host: &str) -> Option<&ProxyAddr> {
+        let host = host.to_ascii_lowercase();
+        self.upstream.as_ref().filter(|_| !self.bypass.iter().any(|b| glob(b, &host)))
+    }
+
+    /// TLS を復号せずに中継するホストか（CONNECT のホストか SNI のどちらかが一致すれば）。
+    pub fn passthrough(&self, hosts: &[&str]) -> bool {
+        hosts.iter().any(|h| {
+            let h = h.to_ascii_lowercase();
+            self.passthrough.iter().any(|p| glob(p, &h))
+        })
+    }
+
+    pub fn has_passthrough(&self) -> bool {
+        !self.passthrough.is_empty()
+    }
+
+    /// 記録する Body の上限（バイト）。
+    pub fn max_record_body(&self) -> usize {
+        (self.settings.max_record_body_mb.max(1) as usize).saturating_mul(1024 * 1024)
     }
 
     /// hosts で上書きした接続先。最初に一致した行が優先（hosts ファイルと同じ）。
@@ -277,6 +409,32 @@ mod tests {
 
         settings.intercept.url_regex = "(".into();
         assert!(CompiledRules::compile(settings).1.is_some());
+    }
+
+    #[test]
+    fn upstream_and_passthrough() {
+        let mut settings = ProjectSettings::default();
+        settings.upstream.enabled = true;
+        settings.upstream.address = "http://proxy.corp:3128/".into();
+        settings.upstream.username = "user".into();
+        settings.upstream.password = "pa:ss".into();
+        settings.upstream.bypass.push_str("\n*.internal  # 社内");
+        settings.tls_passthrough = "*.apple.com\nupdate.example.com, # コメント".into();
+        let (r, err) = CompiledRules::compile(settings.clone());
+        assert!(err.is_none(), "{err:?}");
+        let up = r.upstream_for("example.com").unwrap();
+        assert_eq!((up.host.as_str(), up.port), ("proxy.corp", 3128));
+        assert_eq!(up.auth.as_deref(), Some("Basic dXNlcjpwYTpzcw=="));
+        assert!(r.upstream_for("LOCALHOST").is_none() && r.upstream_for("a.internal").is_none());
+        assert!(r.passthrough(&["x.apple.com"]) && r.passthrough(&["10.0.0.1", "Update.Example.com"]));
+        assert!(!r.passthrough(&["apple.com"]));
+
+        settings.upstream.address = "proxy.corp".into();
+        assert!(settings.upstream.parse().is_err());
+        let (r, _) = CompiledRules::compile(settings);
+        assert!(r.upstream_for("example.com").is_none(), "ポートが無ければ使わない");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b""), "");
     }
 
     #[test]

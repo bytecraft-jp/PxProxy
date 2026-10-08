@@ -1,7 +1,12 @@
+mod comparer_tab;
 mod detail;
+mod findings_tab;
 mod intercept_tab;
 mod repeater_tab;
 mod settings_tab;
+mod sitemap_tab;
+#[cfg(test)]
+mod smoke_tests;
 mod tasks;
 
 use std::collections::HashMap;
@@ -15,13 +20,16 @@ use egui::{Align, Color32, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
 use px_proxy::{CertAuthority, Held, ProjectSettings, ProxyContext, ProxyServer};
 use px_store::{
-    ALL_KINDS, ALL_STATUS, CommitHook, Filter, FlowKind, FlowSummary, Project, Reader, StatusClass,
+    ALL_KINDS, ALL_STATUS, CommitHook, Filter, FlowKind, FlowSource, FlowSummary, Project, Reader, Severity, StatusClass,
 };
 
 use crate::view;
+use comparer_tab::Comparer;
 use detail::{CodecWindow, Detail, Search, Selection, ViewMode};
+use findings_tab::Findings;
 use intercept_tab::Editor;
 use repeater_tab::Repeater;
+use sitemap_tab::SiteMap;
 use tasks::BgTask;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
@@ -36,8 +44,23 @@ const YELLOW: Color32 = Color32::from_rgb(240, 200, 80);
 enum Tab {
     Intercept,
     History,
+    SiteMap,
     Repeater,
+    Comparer,
+    Findings,
     Settings,
+}
+
+impl Tab {
+    /// 通信の一覧（History と同じ表）を出すタブ
+    fn has_list(self) -> bool {
+        matches!(self, Self::History | Self::SiteMap)
+    }
+
+    /// 詳細ペインを出すタブ
+    fn has_detail(self) -> bool {
+        matches!(self, Self::History | Self::SiteMap | Self::Findings)
+    }
 }
 
 /// History の一覧でメモを編集中の行。
@@ -95,7 +118,10 @@ pub struct PxApp {
     recent: Vec<PathBuf>,
     new_project: Option<NewProjectForm>,
 
+    /// フィルタバーの条件
     filter: Filter,
+    /// 一覧に適用中の条件（フィルタバー + サイトマップで選んだノード）。`ids` はこの条件の結果
+    applied: Filter,
     /// 現在のフィルタに一致する ID（昇順）。行 i は ids[i]。
     ids: Vec<i64>,
     last_id: i64,
@@ -126,6 +152,9 @@ pub struct PxApp {
     held_selected: Option<u64>,
     editors: HashMap<u64, Editor>,
     repeater: Repeater,
+    site_map: SiteMap,
+    findings: Findings,
+    comparer: Comparer,
 
     status: String,
 }
@@ -149,6 +178,7 @@ impl PxApp {
             recent: load_recent(),
             new_project: None,
             filter: Filter::default(),
+            applied: Filter::default(),
             ids: Vec::new(),
             last_id: 0,
             total: 0,
@@ -172,6 +202,9 @@ impl PxApp {
             held_selected: None,
             editors: HashMap::new(),
             repeater: Repeater::default(),
+            site_map: SiteMap::default(),
+            findings: Findings::default(),
+            comparer: Comparer::default(),
             status: "案件を作成するか、既存の案件を開いてください".into(),
         };
         app.apply_launch(opts);
@@ -247,6 +280,12 @@ impl PxApp {
         self.forget_detail_images();
         self.detail = None;
         self.selected = None;
+        self.site_map = SiteMap::default();
+        self.findings.clear();
+        for uri in self.comparer.image_uris() {
+            self.egui_ctx.forget_image(uri);
+        }
+        self.comparer.clear();
     }
 
     fn set_title(&self, name: Option<&str>) {
@@ -271,19 +310,26 @@ impl PxApp {
         self.dirty.store(true, Ordering::Release);
     }
 
-    fn set_filter(&mut self, f: Filter) {
-        if f != self.filter {
-            self.filter = f;
-            self.reset_list();
+    /// 一覧に適用する条件。サイトマップではツリーで選んだノードで絞る。
+    fn effective_filter(&self) -> Filter {
+        let mut f = self.filter.clone();
+        if self.tab == Tab::SiteMap {
+            f.site = self.site_map.selected.clone();
         }
+        f
     }
 
     fn refresh(&mut self) {
+        let wanted = self.effective_filter();
+        if wanted != self.applied {
+            self.applied = wanted;
+            self.reset_list();
+        }
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return;
         }
         let Some(reader) = &self.reader else { return };
-        match reader.ids_after(self.last_id, &self.filter) {
+        match reader.ids_after(self.last_id, &self.applied) {
             Ok(new) => {
                 if let Some(&last) = new.last() {
                     self.last_id = last;
@@ -293,6 +339,13 @@ impl PxApp {
             Err(e) => self.status = format!("読み込みエラー: {e}"),
         }
         self.total = reader.count().unwrap_or(self.total);
+        if let Err(e) = self.site_map.update(reader) {
+            self.status = format!("サイトマップの読み込みエラー: {e}");
+        }
+        self.findings.dirty = true;
+        if let Some(d) = &mut self.detail {
+            d.refresh_ws(reader);
+        }
     }
 
     fn create_project(&mut self, target: PathBuf) {
@@ -300,12 +353,22 @@ impl PxApp {
     }
 
     fn menu_open_project(&mut self) {
-        if let Some(dir) = rfd::FileDialog::new().set_title("案件フォルダ (*.pxproj) を選択").pick_folder() {
+        if let Some(dir) =
+            rfd::FileDialog::new().set_title("案件フォルダ (*.pxproj)、または新しい案件にする空のフォルダを選択").pick_folder()
+        {
             self.open_dir(dir);
         }
     }
 
+    /// 案件を開く。空のフォルダなら、そこを新しい案件として初期化する。
     fn open_dir(&mut self, dir: PathBuf) {
+        if is_empty_dir(&dir) {
+            self.create_project(dir.clone());
+            if self.project.as_ref().is_some_and(|p| p.dir() == dir) {
+                self.status = format!("空のフォルダを新しい案件として初期化しました: {}", dir.display());
+            }
+            return;
+        }
         if !dir.join("project.toml").exists() {
             self.status = format!("案件フォルダではありません（project.toml がありません）: {}", dir.display());
             return;
@@ -366,14 +429,20 @@ impl PxApp {
                 let request = view::render_message(&d.req_head, &d.req_body, &format!("{id}/req"));
                 let response = match &d.res_head {
                     Some(h) => view::render_message(h, &d.res_body, &format!("{id}/res")),
+                    None if d.summary.source == FlowSource::Tunnel => view::Rendered::plain(
+                        "[TLS パススルー] 復号せずにそのまま中継したため、中身は記録していません".into(),
+                    ),
                     None => view::Rendered::plain(d.summary.error.clone().map(|e| format!("[エラー] {e}")).unwrap_or_default()),
                 };
                 let originals = [
                     d.orig_request.as_ref().map(|(h, b)| view::render_message(h, b, &format!("{id}/req-orig"))),
                     d.orig_response.as_ref().map(|(h, b)| view::render_message(h, b, &format!("{id}/res-orig"))),
                 ];
+                let findings = reader.findings_of(id).unwrap_or_default();
+                let ws = (d.summary.status == Some(101)).then(|| reader.ws_messages(id, 0).unwrap_or_default());
+                let kept = [d.req_body.len(), d.res_body.len()];
                 self.forget_detail_images();
-                self.detail = Some(Detail::new(id, [request, response], originals));
+                self.detail = Some(Detail::new(d.summary, findings, kept, [request, response], originals, ws));
                 self.selection = None;
                 self.search.reset_position();
             }
@@ -392,11 +461,7 @@ impl PxApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input()
-            || self.ids.is_empty()
-            || self.new_project.is_some()
-            || self.tab != Tab::History
-        {
+        if ctx.egui_wants_keyboard_input() || self.ids.is_empty() || self.new_project.is_some() || !self.tab.has_list() {
             return;
         }
         let (up, down) = ctx.input(|i| (i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown)));
@@ -517,7 +582,7 @@ impl PxApp {
                 if has_project {
                     ui.checkbox(&mut self.follow, "末尾に追従");
                     ui.separator();
-                    if self.filter.is_default() {
+                    if self.applied.is_default() {
                         ui.label(format!("{} 件", self.total));
                     } else {
                         ui.label(format!("{} / {} 件", self.ids.len(), self.total));
@@ -539,10 +604,17 @@ impl PxApp {
                 0 => RichText::new("Repeater"),
                 n => RichText::new(format!("Repeater ({n})")),
             };
+            let comparer = match self.comparer.len() {
+                0 => RichText::new("Comparer"),
+                n => RichText::new(format!("Comparer ({n}/2)")),
+            };
             for (tab, label) in [
                 (Tab::Intercept, intercept),
                 (Tab::History, RichText::new("History")),
+                (Tab::SiteMap, RichText::new("サイトマップ")),
                 (Tab::Repeater, repeater),
+                (Tab::Comparer, comparer),
+                (Tab::Findings, RichText::new("検出")),
                 (Tab::Settings, RichText::new("診断対象 / ルール")),
             ] {
                 if ui.selectable_label(self.tab == tab, label).clicked() && self.tab != tab {
@@ -592,7 +664,7 @@ impl PxApp {
                 f.status = ALL_STATUS & !(StatusClass::Ok.bit() | StatusClass::Redirect.bit());
             }
         });
-        self.set_filter(f);
+        self.filter = f;
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -734,6 +806,7 @@ impl PxApp {
             .cell_layout(Layout::left_to_right(Align::Center))
             .stick_to_bottom(self.follow)
             .column(Column::exact(60.0))
+            .column(Column::exact(112.0))
             .column(Column::initial(240.0).clip(true))
             .column(Column::exact(64.0))
             .column(Column::initial(400.0).clip(true))
@@ -753,7 +826,9 @@ impl PxApp {
         let selected = self.selected;
         let mut clicked = None;
         let mut scope_add: Option<(String, bool)> = None;
+        let mut passthrough_add: Option<String> = None;
         let mut to_repeater = None;
+        let mut to_comparer = None;
         let note_edit = &mut self.note_edit;
         // (id, 確定したメモ)。None は取り消し
         let mut note_done: Option<Option<(i64, String)>> = None;
@@ -764,12 +839,15 @@ impl PxApp {
 
         table
             .header(row_h, |mut h| {
-                for title in ["#", "Host", "Method", "Path", "Status", "種類", "Length", "ms", "備考", "メモ"] {
+                for title in ["#", "時刻", "Host", "Method", "Path", "Status", "種類", "Length", "ms", "備考", "メモ"] {
                     let (_, r) = h.col(|ui| {
                         ui.strong(title);
                     });
                     match title {
-                        "備考" => r.on_hover_text("エラー・Intercept での編集・Repeater から送った通信を表示します"),
+                        "時刻" => r.on_hover_text("リクエストを受け取った時刻（ローカル時刻）"),
+                        "備考" => r.on_hover_text(
+                            "エラー・Intercept での編集・Repeater から送った通信・TLS パススルー・WebSocket・Body の切り詰め・パッシブチェックの検出を表示します",
+                        ),
                         "メモ" => r.on_hover_text("セルをダブルクリック（または右クリック →「メモを編集」）で入力します"),
                         _ => r,
                     };
@@ -789,6 +867,9 @@ impl PxApp {
                         ui.label(RichText::new(id.to_string()).weak());
                     });
                     row.col(|ui| {
+                        ui.label(view::format_time_short(s.started_at_us)).on_hover_text(view::format_datetime(s.started_at_us));
+                    });
+                    row.col(|ui| {
                         let default_port = if s.scheme == "https" { 443 } else { 80 };
                         let host = if s.port == default_port {
                             format!("{}://{}", s.scheme, s.host)
@@ -804,6 +885,9 @@ impl PxApp {
                         ui.add(egui::Label::new(&s.target).truncate());
                     });
                     row.col(|ui| match s.status {
+                        _ if s.source == FlowSource::Tunnel && s.error.is_none() => {
+                            ui.label(RichText::new("—").weak());
+                        }
                         Some(code) => {
                             ui.label(RichText::new(code.to_string()).color(status_color(code)));
                         }
@@ -824,17 +908,37 @@ impl PxApp {
                         ui.label(format!("{}", s.duration_us / 1000));
                     });
                     row.col(|ui| {
+                        if let Some(sev) = s.max_severity {
+                            ui.label(RichText::new("⚠").color(severity_color(sev)))
+                                .on_hover_text(format!("パッシブチェックの検出あり（最大の重要度: {}）", sev.label()));
+                        }
                         if let Some(e) = &s.error {
                             ui.add(egui::Label::new(RichText::new(e).color(RED)).truncate());
-                        } else if s.edited != 0 {
+                            return;
+                        }
+                        if s.edited != 0 {
                             let what = match s.edited {
                                 px_store::EDITED_REQUEST => "Req",
                                 px_store::EDITED_RESPONSE => "Res",
                                 _ => "Req/Res",
                             };
                             ui.label(RichText::new(format!("編集済み ({what})")).color(YELLOW));
-                        } else if s.source == px_store::FlowSource::Repeater {
-                            ui.label(RichText::new("Repeater").weak());
+                        }
+                        match s.source {
+                            FlowSource::Repeater => {
+                                ui.label(RichText::new("Repeater").weak());
+                            }
+                            FlowSource::Tunnel => {
+                                ui.label(RichText::new("TLS パススルー").weak());
+                            }
+                            _ => {}
+                        }
+                        if s.status == Some(101) {
+                            ui.label(RichText::new("WebSocket").color(Color32::from_rgb(100, 160, 240)));
+                        }
+                        if s.truncated != 0 {
+                            ui.label(RichText::new("一部のみ記録").color(YELLOW))
+                                .on_hover_text("Body が記録の上限を超えたため、先頭だけを記録しました");
                         }
                     });
                     let (_, note_cell) = row.col(|ui| match note_edit.as_mut().filter(|e| e.id == id) {
@@ -869,6 +973,9 @@ impl PxApp {
                         if ui.button("Repeater に送る (Ctrl+R)").clicked() {
                             to_repeater = Some(id);
                         }
+                        if ui.button("Comparer に送る").on_hover_text("2 件送ると差分を表示します").clicked() {
+                            to_comparer = Some(id);
+                        }
                         if ui.button("メモを編集").clicked() {
                             note_start = Some(id);
                         }
@@ -879,6 +986,14 @@ impl PxApp {
                         }
                         if ui.button("このホストを診断対象から除外").clicked() {
                             scope_add = Some((s.host.clone(), true));
+                        }
+                        if s.scheme == "https"
+                            && ui
+                                .button("このホストを TLS パススルーに追加")
+                                .on_hover_text("以降、このホストの HTTPS は復号せずにそのまま中継します（証明書ピンニングで失敗するアプリ向け）")
+                                .clicked()
+                        {
+                            passthrough_add = Some(s.host.clone());
                         }
                     });
                 });
@@ -891,8 +1006,14 @@ impl PxApp {
         if let Some((host, exclude)) = scope_add {
             self.add_scope_host(&host, exclude);
         }
+        if let Some(host) = passthrough_add {
+            self.add_passthrough_host(&host);
+        }
         if let Some(id) = to_repeater {
             self.send_to_repeater(id);
+        }
+        if let Some(id) = to_comparer {
+            self.send_to_comparer(id);
         }
         if let Some(done) = note_done {
             self.note_edit = None;
@@ -933,6 +1054,15 @@ fn chip(ui: &mut egui::Ui, mask: &mut u32, bit: u32, label: &str) {
     }
 }
 
+fn severity_color(s: Severity) -> Color32 {
+    match s {
+        Severity::High => RED,
+        Severity::Medium => Color32::from_rgb(240, 140, 50),
+        Severity::Low => YELLOW,
+        Severity::Info => Color32::from_rgb(120, 160, 200),
+    }
+}
+
 fn status_color(code: u16) -> Color32 {
     match code {
         100..=299 => GREEN,
@@ -940,6 +1070,11 @@ fn status_color(code: u16) -> Color32 {
         400..=499 => Color32::from_rgb(240, 170, 60),
         _ => RED,
     }
+}
+
+/// 中身の無いフォルダか（存在しない・読めないなら false）。
+fn is_empty_dir(p: &Path) -> bool {
+    std::fs::read_dir(p).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 fn display_name(p: &Path) -> String {
@@ -980,14 +1115,17 @@ impl eframe::App for PxApp {
         self.poll_task();
         self.poll_repeater();
         self.handle_keys(&ctx);
-        if self.tab == Tab::History
+        if self.tab == Tab::Findings {
+            self.refresh_findings(&ctx);
+        }
+        if self.tab.has_detail()
             && self.new_project.is_none()
             && let Some(id) = self.selected
             && ctx.input_mut(|i| i.consume_shortcut(&repeater_tab::SEND_TO_REPEATER_KEY))
         {
             self.send_to_repeater(id);
         }
-        if self.tab == Tab::History
+        if self.tab.has_detail()
             && self.detail.is_some()
             && self.new_project.is_none()
             && ctx.input_mut(|i| i.consume_shortcut(&detail::SEARCH_KEY))
@@ -1002,7 +1140,7 @@ impl eframe::App for PxApp {
             if self.project.is_some() {
                 ui.add_space(4.0);
                 self.tab_bar(ui);
-                if self.tab == Tab::History {
+                if self.tab.has_list() {
                     ui.add_space(2.0);
                     self.filter_bar(ui);
                 }
@@ -1012,12 +1150,31 @@ impl eframe::App for PxApp {
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         if self.project.is_some() {
             match self.tab {
-                Tab::History => {
-                    egui::Panel::bottom("detail")
+                Tab::SiteMap => {
+                    egui::Panel::left("site_map")
                         .resizable(true)
-                        .default_size(360.0)
-                        .min_size(120.0)
-                        .show(ui, |ui| self.detail_pane(ui));
+                        .default_size(320.0)
+                        .min_size(160.0)
+                        .show(ui, |ui| self.site_map_tree(ui));
+                }
+                Tab::Findings => {
+                    egui::Panel::left("findings")
+                        .resizable(true)
+                        .default_size(380.0)
+                        .min_size(200.0)
+                        .show(ui, |ui| self.findings_list(ui));
+                }
+                _ => {}
+            }
+            if self.tab.has_detail() {
+                egui::Panel::bottom("detail")
+                    .resizable(true)
+                    .default_size(360.0)
+                    .min_size(120.0)
+                    .show(ui, |ui| self.detail_pane(ui));
+            }
+            match self.tab {
+                Tab::History | Tab::SiteMap => {
                     egui::CentralPanel::default_margins().show(ui, |ui| {
                         // 列の合計が画面より広いときは横にスクロールする（縦はテーブル自身がスクロールする）
                         egui::ScrollArea::horizontal()
@@ -1025,6 +1182,12 @@ impl eframe::App for PxApp {
                             .auto_shrink(false)
                             .show(ui, |ui| self.history_table(ui));
                     });
+                }
+                Tab::Findings => {
+                    egui::CentralPanel::default_margins().show(ui, |ui| self.findings_items(ui));
+                }
+                Tab::Comparer => {
+                    egui::CentralPanel::default_margins().show(ui, |ui| self.comparer_tab(ui));
                 }
                 Tab::Intercept => {
                     egui::CentralPanel::default_margins().show(ui, |ui| self.intercept_tab(ui));

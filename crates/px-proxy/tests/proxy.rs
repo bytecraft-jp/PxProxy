@@ -457,3 +457,235 @@ Host: 127.0.0.1:{up}
     let (st, _) = tokio::time::timeout(Duration::from_secs(5), roundtrip(&mut a, &req)).await.expect("1 本目が詰まった");
     assert_eq!(st, 200);
 }
+
+/// 設定済みのプロキシと案件を用意する。
+async fn setup(settings: px_proxy::ProjectSettings) -> (tempfile::TempDir, Arc<CertAuthority>, Project, Arc<ProxyContext>, ProxyServer) {
+    let tmp = tempfile::tempdir().unwrap();
+    let ca = Arc::new(CertAuthority::load_or_create(tmp.path().join("ca")).unwrap());
+    let project = Project::create(tmp.path().join("x.pxproj"), None).unwrap();
+    let ctx = ProxyContext::new(ca.clone()).unwrap();
+    ctx.set_sink(Some(project.sink()));
+    assert_eq!(ctx.interceptor().set_settings(settings), None);
+    let proxy = ProxyServer::bind("127.0.0.1:0".parse().unwrap(), ctx.clone()).await.unwrap();
+    (tmp, ca, project, ctx, proxy)
+}
+
+/// 受け取ったリクエストヘッドをそのまま Body に入れて返す、偽の上流プロキシ。
+/// CONNECT は `Proxy-Authorization` が無ければ 407 で断る。
+async fn fake_upstream_proxy() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (s, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut c = Conn::new(s);
+                while let Ok(Some(h)) = c.read_request_head().await {
+                    let res = if h.method == "CONNECT" && h.headers.get("proxy-authorization").is_none() {
+                        "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n".to_string()
+                    } else {
+                        let body = String::from_utf8_lossy(&h.raw).into_owned();
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                    };
+                    c.io.write_all(res.as_bytes()).await.unwrap();
+                }
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_proxy_forwards_http_and_tunnels_https() {
+    // --- 平文 HTTP は absolute-form + Proxy-Authorization で上流プロキシへ
+    let fake = fake_upstream_proxy().await;
+    let upstream_proxy =
+        px_proxy::UpstreamProxy { enabled: true, address: format!("127.0.0.1:{fake}"), username: "u".into(), password: "p".into(), bypass: String::new() };
+    let settings = px_proxy::ProjectSettings { upstream: upstream_proxy, ..Default::default() };
+    let (_tmp, _ca, project, _ctx, proxy) = setup(settings).await;
+    let mut c = Conn::new(TcpStream::connect(proxy.local_addr()).await.unwrap());
+    let (st, body) = roundtrip(&mut c, "GET http://site.invalid/a?b=1 HTTP/1.1\r\nHost: site.invalid\r\n\r\n").await;
+    assert_eq!(st, 200);
+    let seen = String::from_utf8(body).unwrap();
+    assert!(seen.starts_with("GET http://site.invalid/a?b=1 HTTP/1.1\r\nProxy-Authorization: Basic dTpw\r\nHost: site.invalid\r\n"), "{seen}");
+    let reader = wait_count(&project, 1).await;
+    let d = reader.detail(1).unwrap().unwrap();
+    assert!(d.req_head.starts_with(b"GET /a?b=1 HTTP/1.1\r\n"), "記録はオリジンサーバへのリクエストのまま");
+
+    // --- HTTPS は上流プロキシへ CONNECT する（ここでは pxproxy をもう 1 つ上流に置く）
+    let (_tmp2, _, project2, _, chained) = setup(Default::default()).await;
+    let upstream_proxy = px_proxy::UpstreamProxy { enabled: true, address: chained.local_addr().to_string(), bypass: String::new(), ..Default::default() };
+    let settings = px_proxy::ProjectSettings { upstream: upstream_proxy, ..Default::default() };
+    let (_tmp, ca, project, _ctx, proxy) = setup(settings).await;
+    let https_port = upstream(Some(ca.server_config("localhost").unwrap())).await;
+    let mut tcp = Conn::new(TcpStream::connect(proxy.local_addr()).await.unwrap());
+    tcp.io.write_all(format!("CONNECT localhost:{https_port} HTTP/1.1\r\n\r\n").as_bytes()).await.unwrap();
+    assert_eq!(tcp.read_response_head().await.unwrap().unwrap().status, 200);
+    let tls = trusting(&ca).connect(ServerName::try_from("localhost").unwrap(), tcp.io).await.unwrap();
+    let mut c = Conn::new(tls);
+    let (st, body) = roundtrip(&mut c, "GET /chained HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+    assert_eq!((st, body.as_slice()), (200, &b"GET /chained body="[..]));
+    // 両方の pxproxy に記録される
+    assert_eq!(wait_count(&project, 1).await.count().unwrap(), 1);
+    assert_eq!(wait_count(&project2, 1).await.count().unwrap(), 1);
+
+    // --- 上流プロキシが CONNECT を断ったら 502 とその理由
+    let upstream_proxy = px_proxy::UpstreamProxy { enabled: true, address: format!("127.0.0.1:{fake}"), bypass: String::new(), ..Default::default() };
+    let settings = px_proxy::ProjectSettings { upstream: upstream_proxy, ..Default::default() };
+    let (_tmp, _, project, _ctx, proxy) = setup(settings).await;
+    let mut c = Conn::new(TcpStream::connect(proxy.local_addr()).await.unwrap());
+    let (st, body) = roundtrip(&mut c, "GET https://site.invalid/ HTTP/1.1\r\nHost: site.invalid\r\n\r\n").await;
+    assert_eq!(st, 502);
+    assert!(String::from_utf8_lossy(&body).contains("407"), "{}", String::from_utf8_lossy(&body));
+    assert!(wait_count(&project, 1).await.summary(1).unwrap().unwrap().error.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_passthrough_keeps_server_certificate() {
+    let settings = px_proxy::ProjectSettings { tls_passthrough: "*.nomitm.test localhost".into(), ..Default::default() };
+    let (tmp, _ca, project, _ctx, proxy) = setup(settings).await;
+    // 上流は別の CA の証明書。クライアントはその CA だけを信頼するので、復号されていたら繋がらない
+    let real = CertAuthority::load_or_create(tmp.path().join("real-ca")).unwrap();
+    let https_port = upstream(Some(real.server_config("localhost").unwrap())).await;
+    let mut tcp = Conn::new(TcpStream::connect(proxy.local_addr()).await.unwrap());
+    tcp.io.write_all(format!("CONNECT localhost:{https_port} HTTP/1.1\r\n\r\n").as_bytes()).await.unwrap();
+    assert_eq!(tcp.read_response_head().await.unwrap().unwrap().status, 200);
+    let tls = trusting(&real)
+        .connect(ServerName::try_from("localhost").unwrap(), tcp.io)
+        .await
+        .expect("パススルーなら上流の本物の証明書が見える");
+    let mut c = Conn::new(tls);
+    let (st, body) = roundtrip(&mut c, "GET /raw HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+    assert_eq!((st, body.as_slice()), (200, &b"GET /raw body="[..]));
+
+    let reader = wait_count(&project, 1).await;
+    let s = reader.summary(1).unwrap().unwrap();
+    assert_eq!(s.source, px_store::FlowSource::Tunnel);
+    assert_eq!((s.method.as_str(), s.target.clone()), ("CONNECT", format!("localhost:{https_port}")));
+    assert_eq!(reader.count().unwrap(), 1, "中身は復号しないので記録は CONNECT の 1 件だけ");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_are_streamed_and_large_bodies_truncated() {
+    let settings = px_proxy::ProjectSettings { max_record_body_mb: 1, ..Default::default() };
+    let (_tmp, _ca, project, _ctx, proxy) = setup(settings).await;
+
+    // SSE のように最後まで送らない上流: 先頭のチャンクがすぐクライアントに届くこと
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sse_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (s, _) = listener.accept().await.unwrap();
+        let mut c = Conn::new(s);
+        c.read_request_head().await.unwrap();
+        c.io.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n6\r\ndata:1\r\n")
+            .await
+            .unwrap();
+        let _ = finish_rx.await;
+        c.io.write_all(b"0\r\n\r\n").await.unwrap();
+    });
+    let mut c = Conn::new(TcpStream::connect(proxy.local_addr()).await.unwrap());
+    c.io.write_all(format!("GET http://127.0.0.1:{sse_port}/events HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).await.unwrap();
+    let head = c.read_response_head().await.unwrap().unwrap();
+    assert_eq!(head.status, 200);
+    let first = tokio::time::timeout(Duration::from_secs(3), async {
+        while !c.buf.windows(6).any(|w| w == b"data:1") {
+            assert!(c.fill().await.unwrap() > 0);
+        }
+    })
+    .await;
+    assert!(first.is_ok(), "上流が終わる前に最初のイベントが届く");
+    finish_tx.send(()).unwrap();
+    let body = c.read_body(BodyKind::Chunked).await.unwrap();
+    assert_eq!(body.decoded(), b"data:1");
+
+    // 3MB の応答と 2MB の送信: 全部届くが、記録は先頭 1MB
+    let port = upstream(None).await;
+    let big = "x".repeat(2 * 1024 * 1024 + 10);
+    let req = format!("POST http://127.0.0.1:{port}/up HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{big}", big.len());
+    let (st, body) = roundtrip(&mut c, &req).await;
+    assert_eq!(st, 200);
+    assert_eq!(body.len(), "POST /up body=".len() + big.len(), "流しても全部届く");
+
+    let reader = wait_count(&project, 2).await;
+    let sse = reader.detail(1).unwrap().unwrap();
+    assert_eq!(sse.res_body, b"data:1");
+    let d = reader.detail(2).unwrap().unwrap();
+    assert_eq!(d.summary.truncated, px_store::TRUNCATED_REQUEST | px_store::TRUNCATED_RESPONSE);
+    assert_eq!((d.req_body.len(), d.summary.req_body_len), (1024 * 1024, big.len() as i64));
+    assert_eq!((d.res_body.len(), d.summary.res_body_len), (1024 * 1024, body.len() as i64));
+}
+
+/// 1 フレームを読む（テスト用: 125 バイト以下）。マスクされていれば外す。
+async fn read_frame<S: AsyncRead + AsyncWrite + Unpin>(c: &mut Conn<S>) -> (u8, Vec<u8>) {
+    while c.buf.len() < 2 {
+        assert!(c.fill().await.unwrap() > 0);
+    }
+    let masked = c.buf[1] & 0x80 != 0;
+    let len = (c.buf[1] & 0x7f) as usize;
+    let total = 2 + if masked { 4 } else { 0 } + len;
+    while c.buf.len() < total {
+        assert!(c.fill().await.unwrap() > 0);
+    }
+    let f = c.buf.split_to(total);
+    let opcode = f[0] & 0x0f;
+    let payload = if masked {
+        f[6..].iter().enumerate().map(|(i, b)| b ^ f[2 + i % 4]).collect()
+    } else {
+        f[2..].to_vec()
+    };
+    (opcode, payload)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_messages_are_recorded() {
+    let (_tmp, _ca, project, _ctx, proxy) = setup(Default::default()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (s, _) = listener.accept().await.unwrap();
+        let mut c = Conn::new(s);
+        c.read_request_head().await.unwrap();
+        // 101 と同じ書き込みで最初のフレームも送る（プロキシが読み過ぎても取りこぼさない）
+        c.io.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n\x81\x05hello")
+            .await
+            .unwrap();
+        let (_, payload) = read_frame(&mut c).await;
+        let mut reply = vec![0x81, (payload.len() + 5) as u8];
+        reply.extend_from_slice(b"echo:");
+        reply.extend_from_slice(&payload);
+        c.io.write_all(&reply).await.unwrap();
+        // クライアントからの Close に Close で応える
+        let (op, _) = read_frame(&mut c).await;
+        assert_eq!(op, 8);
+        c.io.write_all(&[0x88, 0]).await.unwrap();
+    });
+    let mut c = Conn::new(TcpStream::connect(proxy.local_addr()).await.unwrap());
+    c.io.write_all(
+        format!("GET http://127.0.0.1:{port}/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.read_response_head().await.unwrap().unwrap().status, 101);
+    assert_eq!(read_frame(&mut c).await, (1, b"hello".to_vec()));
+    let key = [9, 8, 7, 6];
+    let mut frame = vec![0x81, 0x80 | 2];
+    frame.extend_from_slice(&key);
+    frame.extend(b"hi".iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
+    c.io.write_all(&frame).await.unwrap();
+    assert_eq!(read_frame(&mut c).await, (1, b"echo:hi".to_vec()));
+    c.io.write_all(&[0x88, 0x80, 0, 0, 0, 0]).await.unwrap();
+    assert_eq!(read_frame(&mut c).await.0, 8);
+
+    let reader = wait_count(&project, 1).await;
+    let mut msgs = Vec::new();
+    for _ in 0..100 {
+        msgs = reader.ws_messages(1, 0).unwrap();
+        if msgs.len() >= 5 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let got: Vec<(bool, u8, &[u8])> = msgs.iter().map(|m| (m.from_client, m.opcode, m.data.as_slice())).collect();
+    assert_eq!(got, [(false, 1, &b"hello"[..]), (true, 1, b"hi"), (false, 1, b"echo:hi"), (true, 8, b""), (false, 8, b"")]);
+}

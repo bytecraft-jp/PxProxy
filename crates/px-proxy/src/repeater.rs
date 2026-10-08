@@ -77,7 +77,8 @@ impl ProxyContext {
         let started = Instant::now();
         let result = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
             let mut up = connect(self, &target).await?;
-            up.io.write_all(&rb.head).await?;
+            let wire = up.request_head(&rb.head).into_owned();
+            up.io.write_all(&wire).await?;
             up.io.write_all(&rb.body_wire).await?;
             up.io.flush().await?;
             // 1xx（101 以外）は読み飛ばす

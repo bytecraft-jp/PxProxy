@@ -18,7 +18,9 @@ parking_lot = "0.12.5"
 px-proxy = { version = "0.1.0", path = "../px-proxy" }
 px-store = { version = "0.1.0", path = "../px-store" }
 rfd = "0.17.2"
+similar = "3.2.0"
 skrifa = "0.44"
+time = { version = "0.3.55", features = ["local-offset"] }
 tokio = { version = "1.53.2", features = ["rt-multi-thread"] }
 toml = "1.1.6"
 tracing = "0.1.44"
@@ -30,7 +32,8 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 brotli = "9.0.0"
-egui_kittest = "0.36.2"
+egui_kittest = { version = "0.36.2", features = ["eframe"] }
+tempfile = "3.27.0"
 
 [build-dependencies]
 winresource = "0.1"

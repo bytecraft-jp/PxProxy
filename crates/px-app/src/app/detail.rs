@@ -1,11 +1,13 @@
-//! History の詳細ペイン（整形・ハイライト・検索）と、エンコード / デコード窓。
+//! History の詳細ペイン（整形・ハイライト・検索・WebSocket のメッセージ）と、エンコード / デコード窓。
 
 use std::ops::Range;
 
 use egui::text::{CCursor, LayoutJob};
-use egui::{Align, Key, KeyboardShortcut, Modifiers, RichText};
+use egui::{Align, Color32, Key, KeyboardShortcut, Layout, Modifiers, RichText};
+use egui_extras::{Column, TableBuilder};
+use px_store::{Finding, FlowSummary, Reader, WsMessage};
 
-use super::{PxApp, YELLOW};
+use super::{GREEN, PxApp, YELLOW, severity_color};
 use crate::codec::{self, Output};
 use crate::highlight::{self, MAX_MATCHES, Theme};
 use crate::view::{self, Rendered};
@@ -64,6 +66,12 @@ struct Painted {
 
 pub(super) struct Detail {
     pub(super) id: i64,
+    /// 一覧の行（時刻・所要時間・Body の切り詰めなど）
+    summary: FlowSummary,
+    /// パッシブチェックの検出（重い順）
+    findings: Vec<Finding>,
+    /// 記録した Body の長さ [Request, Response]（切り詰めの表示用）
+    kept: [usize; 2],
     /// [Request, Response]
     sides: [Rendered; 2],
     /// Intercept で編集された場合の編集前 [Request, Response]
@@ -71,11 +79,43 @@ pub(super) struct Detail {
     /// 編集前を表示するか
     show_orig: [bool; 2],
     painted: [Option<Painted>; 2],
+    /// WebSocket に切り替わった通信なら、そのメッセージ
+    ws: Option<WsView>,
+    /// HTTP ではなく WebSocket のメッセージを表示中
+    show_ws: bool,
 }
 
 impl Detail {
-    pub(super) fn new(id: i64, sides: [Rendered; 2], originals: [Option<Rendered>; 2]) -> Self {
-        Self { id, sides, originals, show_orig: [false; 2], painted: [None, None] }
+    pub(super) fn new(
+        summary: FlowSummary,
+        findings: Vec<Finding>,
+        kept: [usize; 2],
+        sides: [Rendered; 2],
+        originals: [Option<Rendered>; 2],
+        ws: Option<Vec<WsMessage>>,
+    ) -> Self {
+        let show_ws = ws.as_ref().is_some_and(|m| !m.is_empty());
+        Self {
+            id: summary.id,
+            summary,
+            findings,
+            kept,
+            sides,
+            originals,
+            show_orig: [false; 2],
+            painted: [None, None],
+            ws: ws.map(WsView::new),
+            show_ws,
+        }
+    }
+
+    /// 記録が増えたら WebSocket のメッセージを読み足す。
+    pub(super) fn refresh_ws(&mut self, reader: &Reader) {
+        let Some(ws) = &mut self.ws else { return };
+        match reader.ws_messages(self.id, ws.last_id) {
+            Ok(more) => ws.append(more),
+            Err(e) => tracing::warn!("websocket messages: {e}"),
+        }
     }
 
     pub(super) fn image_uris(&self) -> impl Iterator<Item = &str> {
@@ -241,6 +281,15 @@ impl PxApp {
             return;
         };
         let modes: [ViewMode; 2] = std::array::from_fn(|i| view_pref[i].resolve(d.shown(i)));
+
+        // ---- 日時・所要時間・記録の注記・検出
+        info_bar(ui, d);
+        if d.show_ws
+            && let Some(ws) = &mut d.ws
+        {
+            ws_pane(ui, ws, selection);
+            return;
+        }
 
         // ---- 検索バー
         ui.horizontal(|ui| {
@@ -553,6 +602,203 @@ fn result_row(
             ui.set_width(ui.available_width());
             ui.add(egui::Label::new(RichText::new(shown).monospace()).wrap().selectable(true));
         });
+    }
+}
+
+/// 詳細ペインの先頭の 1 行: 日時・所要時間・Body の切り詰め・パッシブチェックの検出・HTTP / WebSocket の切り替え。
+fn info_bar(ui: &mut egui::Ui, d: &mut Detail) {
+    let s = &d.summary;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(format!("#{}", s.id)).strong());
+        ui.label(view::format_datetime(s.started_at_us)).on_hover_text("リクエストを受け取った時刻（ローカル時刻）");
+        ui.label(RichText::new(format!("{} ms", s.duration_us / 1000)).weak()).on_hover_text("所要時間");
+        for (bit, side, len, kept) in [
+            (px_store::TRUNCATED_REQUEST, "Request", s.req_body_len, d.kept[0]),
+            (px_store::TRUNCATED_RESPONSE, "Response", s.res_body_len, d.kept[1]),
+        ] {
+            if s.truncated & bit != 0 {
+                ui.separator();
+                ui.label(RichText::new(format!("{side} の Body は先頭 {} のみ記録（全体 {}）", view::human_size(kept as i64), view::human_size(len))).color(YELLOW))
+                    .on_hover_text("「診断対象 / ルール」の「記録する Body の上限」を超えたため、通信はそのまま流し、先頭だけを記録しました");
+            }
+        }
+        if let Some(worst) = d.findings.first().map(|f| f.severity) {
+            ui.separator();
+            let label = RichText::new(format!("⚠ 検出 {} 件", d.findings.len())).color(severity_color(worst));
+            ui.label(label).on_hover_ui(|ui| {
+                for f in &d.findings {
+                    let title = px_store::passive::check(&f.check).map_or(f.check.as_str(), |c| c.title);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("[{}]", f.severity.label())).color(severity_color(f.severity)));
+                        ui.label(format!("{title}: {}", f.detail));
+                    });
+                }
+            });
+        }
+        if let Some(ws) = &d.ws {
+            ui.separator();
+            if ui.selectable_label(!d.show_ws, "HTTP").clicked() {
+                d.show_ws = false;
+            }
+            if ui.selectable_label(d.show_ws, format!("WebSocket ({})", ws.messages.len())).clicked() {
+                d.show_ws = true;
+            }
+        }
+    });
+}
+
+/// WebSocket のメッセージ一覧と、選んだメッセージの中身。
+pub(super) struct WsView {
+    messages: Vec<WsMessage>,
+    last_id: i64,
+    selected: Option<usize>,
+    /// 選んだメッセージの表示用テキスト (位置, テキスト)
+    shown: Option<(usize, String)>,
+    /// 新しいメッセージが来たら末尾を表示する
+    follow: bool,
+}
+
+/// 一覧に出す中身の長さ
+const WS_PREVIEW: usize = 160;
+/// メッセージの中身の表示上限
+const WS_MAX_SHOWN: usize = 512 * 1024;
+
+impl WsView {
+    fn new(messages: Vec<WsMessage>) -> Self {
+        let mut v = Self { messages: Vec::new(), last_id: 0, selected: None, shown: None, follow: true };
+        v.append(messages);
+        v
+    }
+
+    fn append(&mut self, more: Vec<WsMessage>) {
+        if let Some(m) = more.last() {
+            self.last_id = m.id;
+        }
+        self.messages.extend(more);
+    }
+
+    fn text_of(m: &WsMessage) -> String {
+        if m.opcode == WsMessage::BINARY || std::str::from_utf8(&m.data).is_err() {
+            let mut out = String::new();
+            let shown = &m.data[..m.data.len().min(64 * 1024)];
+            view::hexdump(&mut out, shown);
+            if m.data.len() > shown.len() {
+                out.push_str(&format!("[... {} bytes 省略 ...]", m.data.len() - shown.len()));
+            }
+            return out;
+        }
+        let text = String::from_utf8_lossy(&m.data);
+        let text = view::pretty_json(&text).unwrap_or_else(|| text.into_owned());
+        view::truncate_str(&text, WS_MAX_SHOWN).to_string()
+    }
+}
+
+fn ws_preview(m: &WsMessage) -> String {
+    if m.data.is_empty() {
+        return String::new();
+    }
+    match std::str::from_utf8(&m.data[..m.data.len().min(WS_PREVIEW * 4)]) {
+        Ok(s) if m.opcode != WsMessage::BINARY => s.chars().take(WS_PREVIEW).map(|c| if c.is_control() { ' ' } else { c }).collect(),
+        _ => m.data.iter().take(32).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
+    }
+}
+
+fn ws_pane(ui: &mut egui::Ui, ws: &mut WsView, selection: &mut Option<Selection>) {
+    if ws.messages.is_empty() {
+        ui.centered_and_justified(|ui| ui.label(RichText::new("まだメッセージがありません（通信が続いている間は届いたものから表示します）").weak()));
+        return;
+    }
+    let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+    let mut clicked = None;
+    ui.columns(2, |cols| {
+        let ui = &mut cols[0];
+        ui.horizontal(|ui| {
+            ui.strong(format!("メッセージ {} 件", ws.messages.len()));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.checkbox(&mut ws.follow, "末尾に追従"));
+        });
+        ui.style_mut().interaction.selectable_labels = false;
+        TableBuilder::new(ui)
+            .id_salt("ws_messages")
+            .striped(true)
+            .sense(egui::Sense::click())
+            .cell_layout(Layout::left_to_right(Align::Center))
+            .stick_to_bottom(ws.follow)
+            .column(Column::exact(28.0))
+            .column(Column::exact(96.0))
+            .column(Column::exact(52.0))
+            .column(Column::exact(60.0))
+            .column(Column::remainder().clip(true))
+            .header(row_h, |mut h| {
+                for t in ["", "時刻", "種類", "長さ", "内容"] {
+                    h.col(|ui| {
+                        ui.strong(t);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(row_h, ws.messages.len(), |mut row| {
+                    let i = row.index();
+                    let m = &ws.messages[i];
+                    row.set_selected(ws.selected == Some(i));
+                    row.col(|ui| {
+                        let (arrow, color, tip) = if m.from_client {
+                            ("↑", GREEN, "クライアント → サーバ")
+                        } else {
+                            ("↓", Color32::from_rgb(100, 160, 240), "サーバ → クライアント")
+                        };
+                        ui.label(RichText::new(arrow).color(color).strong()).on_hover_text(tip);
+                    });
+                    row.col(|ui| {
+                        ui.label(RichText::new(view::format_clock(m.at_us)).weak());
+                    });
+                    row.col(|ui| {
+                        ui.label(m.opcode_label());
+                    });
+                    row.col(|ui| {
+                        ui.label(view::human_size(m.len as i64));
+                    });
+                    row.col(|ui| {
+                        ui.add(egui::Label::new(RichText::new(ws_preview(m)).monospace()).truncate());
+                    });
+                    if row.response().clicked() {
+                        clicked = Some(i);
+                    }
+                });
+            });
+
+        let ui = &mut cols[1];
+        let Some(i) = ws.selected else {
+            ui.centered_and_justified(|ui| ui.label(RichText::new("メッセージを選ぶと中身を表示します").weak()));
+            return;
+        };
+        let m = &ws.messages[i];
+        if ws.shown.as_ref().is_none_or(|(at, _)| *at != i) {
+            ws.shown = Some((i, WsView::text_of(m)));
+        }
+        let text = &ws.shown.as_ref().expect("set above").1;
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(if m.from_client { "↑ クライアント → サーバ" } else { "↓ サーバ → クライアント" });
+            ui.label(format!("{}  {} bytes  {}", m.opcode_label(), m.len, view::format_datetime(m.at_us)));
+            if m.len > m.data.len() as u64 {
+                ui.label(RichText::new(format!("（先頭 {} のみ記録）", view::human_size(m.data.len() as i64))).color(YELLOW));
+            }
+            if ui.small_button("コピー").clicked() {
+                ui.ctx().copy_text(text.clone());
+            }
+        });
+        egui::ScrollArea::both().id_salt(("ws_body", i)).auto_shrink(false).show(ui, |ui| {
+            let mut shown = text.as_str();
+            let edit = egui::TextEdit::multiline(&mut shown)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY)
+                .code_editor();
+            let out = show_keeping_selection(ui, ("ws_body", i), edit);
+            selection_menu(&out, shown, None, selection);
+        });
+    });
+    if let Some(i) = clicked {
+        ws.selected = Some(i);
+        ws.follow = false;
     }
 }
 
