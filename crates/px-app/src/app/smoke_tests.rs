@@ -128,6 +128,21 @@ fn every_tab_renders_recorded_traffic() {
     assert!(has_label(&h, "上流プロキシを使う"));
     assert!(has_label(&h, "記録する Body の上限"));
 
+    // ダミーサーバ: 追加すると / の応答が付いた状態で作られ、settings.toml に保存される
+    h.state_mut().tab = Tab::Mock;
+    h.run_steps(2);
+    h.get_by_label("＋ ダミーサーバを追加").click();
+    h.run_steps(3);
+    assert_eq!(h.state().settings.mock_servers.len(), 1);
+    assert_eq!(h.state().settings.mock_servers[0].routes[0].path, "/");
+    assert!(has_label(&h, "ホスト名を入力してください"));
+    h.get_by_label("＋ パスを追加").click();
+    h.run_steps(3);
+    assert_eq!(h.state().settings.mock_servers[0].routes.len(), 2);
+    assert!(has_label(&h, "パスは / で始めてください"), "追加したパスは空");
+    let saved = std::fs::read_to_string(h.state().project.as_ref().unwrap().settings_path()).unwrap();
+    assert!(saved.contains("[[mock_servers]]"), "{saved}");
+
     // 案件でも空でもないフォルダは開かない
     let other = tmp.path().join("other");
     std::fs::create_dir_all(&other).unwrap();

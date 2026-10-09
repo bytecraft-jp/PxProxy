@@ -2,6 +2,7 @@ mod comparer_tab;
 mod detail;
 mod findings_tab;
 mod intercept_tab;
+mod mock_tab;
 mod repeater_tab;
 mod settings_tab;
 mod sitemap_tab;
@@ -49,6 +50,7 @@ enum Tab {
     Comparer,
     Findings,
     Settings,
+    Mock,
 }
 
 impl Tab {
@@ -609,13 +611,14 @@ impl PxApp {
                 n => RichText::new(format!("Comparer ({n}/2)")),
             };
             for (tab, label) in [
-                (Tab::Intercept, intercept),
+                (Tab::Settings, RichText::new("診断対象 / ルール")),
                 (Tab::History, RichText::new("History")),
                 (Tab::SiteMap, RichText::new("サイトマップ")),
+                (Tab::Findings, RichText::new("検出")),
+                (Tab::Intercept, intercept),
                 (Tab::Repeater, repeater),
                 (Tab::Comparer, comparer),
-                (Tab::Findings, RichText::new("検出")),
-                (Tab::Settings, RichText::new("診断対象 / ルール")),
+                (Tab::Mock, RichText::new("ダミーサーバ")),
             ] {
                 if ui.selectable_label(self.tab == tab, label).clicked() && self.tab != tab {
                     self.tab = tab;
@@ -931,6 +934,9 @@ impl PxApp {
                             FlowSource::Tunnel => {
                                 ui.label(RichText::new("TLS パススルー").weak());
                             }
+                            FlowSource::Mock => {
+                                ui.label(RichText::new("ダミーサーバ").weak());
+                            }
                             _ => {}
                         }
                         if s.status == Some(101) {
@@ -1197,6 +1203,9 @@ impl eframe::App for PxApp {
                 }
                 Tab::Settings => {
                     egui::CentralPanel::default_margins().show(ui, |ui| self.settings_tab(ui));
+                }
+                Tab::Mock => {
+                    egui::CentralPanel::default_margins().show(ui, |ui| self.mock_tab(ui));
                 }
             }
         } else {

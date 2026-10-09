@@ -8,6 +8,7 @@ use px_store::{FlowSource, NewFlow};
 use tokio::io::AsyncWriteExt;
 
 use crate::http1::{BodyKind, rebuild_message};
+use crate::mock::MockRequest;
 use crate::server::{Scheme, Target, connect, new_flow, now_us, parse_absolute, parse_authority, parse_edited_request};
 use crate::{ProxyContext, ProxyError, Result};
 
@@ -75,6 +76,18 @@ impl ProxyContext {
         flow.source = FlowSource::Repeater;
 
         let started = Instant::now();
+        // ダミーサーバのホストなら、プロキシ経由と同じ応答を返す（本物のホストへは送らない）
+        let mocked = self.interceptor.rules().mock_for(&target.host).map(|m| {
+            m.respond(&MockRequest { method: &head.method, target: &flow.target, headers: &head.headers.0, body: &flow.req_body })
+        });
+        if let Some(res) = mocked {
+            flow.status = Some(res.status);
+            flow.res_head = Some(res.head);
+            flow.res_body = res.body;
+            flow.duration_us = started.elapsed().as_micros() as i64;
+            self.submit(flow.clone());
+            return Ok(flow);
+        }
         let result = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
             let mut up = connect(self, &target).await?;
             let wire = up.request_head(&rb.head).into_owned();

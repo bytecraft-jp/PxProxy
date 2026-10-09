@@ -18,6 +18,7 @@ use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 use crate::http1::{BodyKind, Conn, RelayError, RequestHead, ResponseHead, rebuild_message, rewrite_target};
 use crate::intercept::{Decision, Direction, Held};
 use crate::limit::{Limited, Limiter};
+use crate::mock::{MockRequest, MockServer};
 use crate::ws::{self, Deflate, Recorder};
 use crate::{ProxyContext, ProxyError, Result};
 
@@ -583,6 +584,17 @@ where
         let interceptor = &ctx.interceptor;
         let rules = interceptor.rules();
         let keep = rules.max_record_body();
+
+        // ---- ダミーサーバ: 上流へは送らずに設定した応答を返す（Intercept の対象外）
+        if let Some(mock) = rules.mock_for(&target.host) {
+            let flow = new_flow(&target, started_at_us, &head.method, path, wire_head, Vec::new());
+            if serve_mock(&mut client, ctx, mock, &head, flow, started, keep).await? {
+                continue;
+            }
+            let _ = client.io.shutdown().await;
+            return Ok(());
+        }
+
         let req_kind = BodyKind::for_request(&head)?;
         let hold_request = interceptor.is_enabled() && {
             let kind = classify(&path, &wire_head, None);
@@ -875,15 +887,67 @@ where
         if upstream_close {
             upstream = None;
         }
-        let client_close = head.headers.has_token("connection", "close")
-            || head.headers.has_token("proxy-connection", "close")
-            || (head.minor_version == 0 && !head.headers.has_token("connection", "keep-alive"))
-            || client_res_kind == BodyKind::UntilClose;
-        if client_close {
+        if client_wants_close(&head) || client_res_kind == BodyKind::UntilClose {
             let _ = client.io.shutdown().await;
             return Ok(());
         }
     }
+}
+
+/// クライアントがこのリクエストで接続を閉じるつもりか。
+fn client_wants_close(head: &RequestHead) -> bool {
+    head.headers.has_token("connection", "close")
+        || head.headers.has_token("proxy-connection", "close")
+        || (head.minor_version == 0 && !head.headers.has_token("connection", "keep-alive"))
+}
+
+/// ダミーサーバの応答を返して記録する。続けて同じ接続で次のリクエストを読めるなら true。
+async fn serve_mock<S: AsyncRead + AsyncWrite + Unpin>(
+    client: &mut Conn<S>,
+    ctx: &ProxyContext,
+    mock: &MockServer,
+    head: &RequestHead,
+    mut flow: NewFlow,
+    started: Instant,
+    keep: usize,
+) -> Result<bool> {
+    flow.source = FlowSource::Mock;
+    // Body は読み捨てる（記録は上限まで）
+    let relayed = client.relay_body(BodyKind::for_request(head)?, &mut tokio::io::sink(), keep).await;
+    flow.req_body_total = relayed.truncated().then_some(relayed.total);
+    flow.req_body = relayed.data;
+    if let Some(e) = relayed.error {
+        let e = match e {
+            RelayError::Read(e) => e,
+            RelayError::Write(e) => e.into(),
+        };
+        flow.duration_us = started.elapsed().as_micros() as i64;
+        flow.error = Some(format!("リクエストの受信に失敗: {e}"));
+        ctx.submit(flow);
+        return Ok(false);
+    }
+    let res = mock.respond(&MockRequest {
+        method: &head.method,
+        target: &flow.target,
+        headers: &head.headers.0,
+        body: &flow.req_body,
+    });
+    let written: io::Result<()> = async {
+        client.io.write_all(&res.head).await?;
+        client.io.write_all(&res.body).await?;
+        client.io.flush().await
+    }
+    .await;
+    flow.duration_us = started.elapsed().as_micros() as i64;
+    flow.status = Some(res.status);
+    flow.res_head = Some(res.head);
+    flow.res_body = res.body;
+    if let Err(e) = &written {
+        flow.error = Some(format!("クライアントへの送信に失敗: {e}"));
+    }
+    ctx.submit(flow);
+    written?;
+    Ok(!client_wants_close(head))
 }
 
 /// クライアントの次のリクエストを待つ。その間に接続の空き待ちが出たら、

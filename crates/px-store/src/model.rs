@@ -10,6 +10,8 @@ pub enum FlowSource {
     Intruder = 2,
     /// TLS パススルー（復号せずに中継した接続）
     Tunnel = 3,
+    /// ダミーサーバが応答した通信
+    Mock = 4,
 }
 
 impl FlowSource {
@@ -18,6 +20,7 @@ impl FlowSource {
             1 => Self::Repeater,
             2 => Self::Intruder,
             3 => Self::Tunnel,
+            4 => Self::Mock,
             _ => Self::Proxy,
         }
     }

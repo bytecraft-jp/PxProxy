@@ -4,6 +4,7 @@ pub mod ca;
 pub mod http1;
 pub mod intercept;
 mod limit;
+pub mod mock;
 mod repeater;
 pub mod rules;
 mod server;
@@ -19,6 +20,7 @@ use thiserror::Error;
 
 pub use ca::CertAuthority;
 pub use intercept::{Decision, Direction, Held, Interceptor};
+pub use mock::{MockRoute, MockServer};
 pub use repeater::{Origin, RepeatRequest};
 pub use rules::{
     ConnectionLimits, DEFAULT_MAX_RECORD_BODY_MB, HostEntry, InterceptRules, ProjectSettings, Scope, ScopeRule,

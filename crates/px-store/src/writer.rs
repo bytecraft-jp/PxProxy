@@ -334,7 +334,8 @@ fn insert_flow(tx: &Transaction<'_>, bodies_dir: &Path, id: i64, f: &NewFlow) ->
 }
 
 fn insert_findings(tx: &Transaction<'_>, id: i64, f: &NewFlow) -> Result<()> {
-    if f.source == FlowSource::Tunnel {
+    // パススルーは中身が無く、ダミーサーバは自分で決めた応答なので調べない
+    if matches!(f.source, FlowSource::Tunnel | FlowSource::Mock) {
         return Ok(());
     }
     let hits = passive::scan(&Exchange {
