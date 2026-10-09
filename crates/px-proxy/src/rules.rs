@@ -1,4 +1,4 @@
-//! 案件ごとの設定（Scope / Intercept ルール / hosts / 接続の制限 / 上流プロキシ / TLS パススルー）とその判定。
+//! 案件ごとの設定（Scope / Intercept ルール / hosts / 接続の制限 / 上流プロキシ / TLS パススルー / ダミーサーバ）とその判定。
 //! 設定は案件フォルダの settings.toml に保存される（保存は UI 側）。
 
 use std::net::IpAddr;
@@ -6,6 +6,8 @@ use std::net::IpAddr;
 use px_store::FlowKind;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+use crate::mock::MockServer;
 
 /// Scope の 1 行。`host` は `*` / `?` のワイルドカード（例: `*.example.com`）、
 /// `path` は前方一致（`*` 可、空なら全パス）。
@@ -103,6 +105,8 @@ pub struct ProjectSettings {
     pub tls_passthrough: String,
     /// 記録する Body の上限（MB）。超えた分は記録せずに転送だけする
     pub max_record_body_mb: u32,
+    /// ダミーサーバ。一致したホスト宛てのリクエストは上流へ送らずに応答する
+    pub mock_servers: Vec<MockServer>,
 }
 
 impl Default for ProjectSettings {
@@ -115,6 +119,7 @@ impl Default for ProjectSettings {
             upstream: UpstreamProxy::default(),
             tls_passthrough: String::new(),
             max_record_body_mb: DEFAULT_MAX_RECORD_BODY_MB,
+            mock_servers: Vec::new(),
         }
     }
 }
@@ -278,7 +283,11 @@ impl CompiledRules {
     }
 
     /// TLS を復号せずに中継するホストか（CONNECT のホストか SNI のどちらかが一致すれば）。
+    /// ダミーサーバのホストは復号して応答するので対象外。
     pub fn passthrough(&self, hosts: &[&str]) -> bool {
+        if hosts.iter().any(|h| self.mock_for(h).is_some()) {
+            return false;
+        }
         hosts.iter().any(|h| {
             let h = h.to_ascii_lowercase();
             self.passthrough.iter().any(|p| glob(p, &h))
@@ -287,6 +296,11 @@ impl CompiledRules {
 
     pub fn has_passthrough(&self) -> bool {
         !self.passthrough.is_empty()
+    }
+
+    /// `host` 宛てに応答するダミーサーバ（上から順に最初に一致したもの）。
+    pub fn mock_for(&self, host: &str) -> Option<&MockServer> {
+        self.settings.mock_servers.iter().find(|m| m.matches_host(host))
     }
 
     /// 記録する Body の上限（バイト）。
@@ -428,6 +442,11 @@ mod tests {
         assert!(r.upstream_for("LOCALHOST").is_none() && r.upstream_for("a.internal").is_none());
         assert!(r.passthrough(&["x.apple.com"]) && r.passthrough(&["10.0.0.1", "Update.Example.com"]));
         assert!(!r.passthrough(&["apple.com"]));
+        let mut mocked = settings.clone();
+        mocked.mock_servers.push(MockServer { host: "x.apple.com".into(), ..Default::default() });
+        let (m, _) = CompiledRules::compile(mocked);
+        assert!(!m.passthrough(&["x.apple.com"]), "ダミーサーバのホストは復号する");
+        assert!(m.passthrough(&["y.apple.com"]));
 
         settings.upstream.address = "proxy.corp".into();
         assert!(settings.upstream.parse().is_err());

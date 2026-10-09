@@ -689,3 +689,80 @@ async fn websocket_messages_are_recorded() {
     let got: Vec<(bool, u8, &[u8])> = msgs.iter().map(|m| (m.from_client, m.opcode, m.data.as_slice())).collect();
     assert_eq!(got, [(false, 1, &b"hello"[..]), (true, 1, b"hi"), (false, 1, b"echo:hi"), (true, 8, b""), (false, 8, b"")]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mock_server_answers_without_upstream() {
+    use px_proxy::{MockRoute, MockServer};
+    let route = |path: &str, methods: &str, status: u16, body: &str| MockRoute {
+        path: path.into(),
+        methods: methods.into(),
+        status,
+        headers: "Content-Type: application/json".into(),
+        body: body.into(),
+    };
+    let mock = MockServer {
+        enabled: true,
+        host: "*.mock.invalid".into(),
+        routes: vec![
+            route("/", "", 200, "top"),
+            route("/api", "GET", 201, "{\"ok\":true}"),
+            route("/echo", "POST", 200, "q={{query.q}} name={{html:form.name}}"),
+        ],
+    };
+    // パススルーにも書いてあるが、ダミーサーバが優先して復号する
+    let settings =
+        px_proxy::ProjectSettings { mock_servers: vec![mock], tls_passthrough: "*.mock.invalid".into(), ..Default::default() };
+    let (_tmp, ca, project, ctx, proxy) = setup(settings).await;
+
+    // --- 平文 HTTP。.invalid は名前解決できないので、上流へつないでいたら 502 になる
+    let mut c = Conn::new(TcpStream::connect(proxy.local_addr()).await.unwrap());
+    let (st, body) = roundtrip(&mut c, "GET http://www.mock.invalid/?q=1 HTTP/1.1\r\nHost: www.mock.invalid\r\n\r\n").await;
+    assert_eq!((st, body.as_slice()), (200, &b"top"[..]));
+    // keep-alive で続けて送れる。Body は読み捨てて次のリクエストを読む
+    let req = "POST http://www.mock.invalid/api HTTP/1.1\r\nHost: www.mock.invalid\r\nContent-Length: 3\r\n\r\nabc";
+    let (st, _) = roundtrip(&mut c, req).await;
+    assert_eq!(st, 405, "/api は GET のみ");
+    let (st, _) = roundtrip(&mut c, "GET http://www.mock.invalid/none HTTP/1.1\r\nHost: www.mock.invalid\r\n\r\n").await;
+    assert_eq!(st, 404);
+
+    // --- CONNECT + TLS（ポートは問わない）
+    let mut tcp = Conn::new(TcpStream::connect(proxy.local_addr()).await.unwrap());
+    tcp.io.write_all(b"CONNECT api.mock.invalid:8443 HTTP/1.1\r\n\r\n").await.unwrap();
+    assert_eq!(tcp.read_response_head().await.unwrap().unwrap().status, 200);
+    let tls = trusting(&ca).connect(ServerName::try_from("api.mock.invalid").unwrap(), tcp.io).await.expect("復号して応答する");
+    let mut c = Conn::new(tls);
+    let (st, body) = roundtrip(&mut c, "GET /api HTTP/1.1\r\nHost: api.mock.invalid:8443\r\n\r\n").await;
+    assert_eq!((st, body.as_slice()), (201, &b"{\"ok\":true}"[..]));
+
+    // --- Repeater もダミーサーバが応答する
+    let flow = ctx
+        .repeat(px_proxy::RepeatRequest {
+            origin: px_proxy::Origin::parse("https://www.mock.invalid").unwrap(),
+            head: b"GET /api HTTP/1.1\r\nHost: www.mock.invalid\r\n\r\n".to_vec(),
+            body: Vec::new(),
+            fix_content_length: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!((flow.status, flow.error), (Some(201), None));
+
+    // --- QueryString と POST の Body を応答に埋め込む
+    let mut c = Conn::new(TcpStream::connect(proxy.local_addr()).await.unwrap());
+    let req = "POST http://www.mock.invalid/echo?q=1 HTTP/1.1
+Host: www.mock.invalid
+Content-Length: 13
+
+name=%3Cx%3E1";
+    let (st, body) = roundtrip(&mut c, req).await;
+    assert_eq!((st, body.as_slice()), (200, &b"q=1 name=&lt;x&gt;1"[..]));
+
+    let reader = wait_count(&project, 6).await;
+    let ids = reader.ids_after(0, &Filter::default()).unwrap();
+    assert_eq!(ids.len(), 6);
+    let d = reader.detail(ids[1]).unwrap().unwrap();
+    assert_eq!(d.summary.source, px_store::FlowSource::Mock);
+    assert_eq!((d.summary.status, d.req_body.as_slice()), (Some(405), &b"abc"[..]));
+    assert!(String::from_utf8_lossy(d.res_head.as_deref().unwrap()).contains("Allow: GET\r\n"));
+    let s = reader.summary(ids[3]).unwrap().unwrap();
+    assert_eq!((s.scheme.as_str(), s.host.as_str(), s.port, s.source), ("https", "api.mock.invalid", 8443, px_store::FlowSource::Mock));
+}

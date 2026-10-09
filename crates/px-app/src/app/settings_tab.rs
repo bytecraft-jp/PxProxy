@@ -251,7 +251,8 @@ impl PxApp {
 
             ui.add_space(12.0);
             if ui.button("既定値に戻す").clicked() {
-                s = ProjectSettings::default();
+                // ダミーサーバは別タブで設定するので残す
+                s = ProjectSettings { mock_servers: s.mock_servers.clone(), ..Default::default() };
             }
             ui.label(RichText::new("設定は案件フォルダの settings.toml に保存され、zip エクスポートにも含まれます。").small().weak());
         });

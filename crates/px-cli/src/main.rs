@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use args::Command;
 use px_proxy::{CertAuthority, ProjectSettings, ProxyContext, ProxyServer};
-use px_store::{NewFlow, Project};
+use px_store::{FlowSource, NewFlow, Project};
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -63,12 +63,20 @@ fn run(dir: &Path, listen: std::net::SocketAddr, create: bool, quiet: bool) -> R
     };
     let ca = Arc::new(CertAuthority::load_or_create(CertAuthority::default_dir())?);
     let ctx = ProxyContext::new(ca)?;
-    // hosts・上流プロキシ・TLS パススルー・記録の上限を効かせるため案件の設定を読む（Intercept は CLI では使わない）
+    // hosts・上流プロキシ・TLS パススルー・記録の上限・ダミーサーバを効かせるため案件の設定を読む（Intercept は CLI では使わない）
     if let Ok(text) = std::fs::read_to_string(project.settings_path()) {
         let settings: ProjectSettings =
             toml::from_str(&text).map_err(|e| format!("settings.toml を読めません: {e}"))?;
         for e in px_proxy::parse_hosts(&settings.hosts).1 {
             eprintln!("警告: hosts {e}");
+        }
+        for m in &settings.mock_servers {
+            if m.enabled {
+                eprintln!("  ダミーサーバ: {}（{} パス）", m.host.trim(), m.routes.len());
+                for p in m.problems() {
+                    eprintln!("警告: ダミーサーバ {}: {p}", m.host.trim());
+                }
+            }
         }
         match settings.upstream.parse() {
             Ok(Some(p)) => eprintln!("  上流プロキシ: {}:{}", p.host, p.port),
@@ -120,6 +128,9 @@ fn log_line(f: &NewFlow) -> String {
     );
     if let Some(e) = &f.error {
         line.push_str(&format!("  [{e}]"));
+    }
+    if f.source == FlowSource::Mock {
+        line.push_str("  (ダミーサーバ)");
     }
     line
 }
