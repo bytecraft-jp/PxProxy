@@ -1,7 +1,7 @@
 //! ダミーサーバタブ: 仮想 Web サーバのホストと、パスごとの応答を設定する（settings.toml に保存）。
 
 use egui::{Align, Layout, RichText};
-use px_proxy::mock::ROOT_PATH;
+use px_proxy::mock::{CONTENT_TYPES, ROOT_PATH};
 use px_proxy::{MockRoute, MockServer};
 
 use super::style::RED;
@@ -40,7 +40,7 @@ impl PxApp {
             egui::CollapsingHeader::new("プレースホルダ（応答にリクエストの内容を埋め込む）").show(ui, |ui| {
                 ui.label(
                     RichText::new(
-                        "レスポンスヘッダと Body に {{名前}} と書くと、リクエストの内容に置き換えます。値が無ければ空になり、解釈できない名前はそのまま残します。既定ではエスケープせずに埋め込みます。",
+                        "レスポンスヘッダと Body に {{名前}} と書くと、リクエストの内容に置き換えます。値が無ければ空になり、解釈できない名前はそのまま残します。既定ではエスケープせずに埋め込みます。ファイルの Body は置き換えません。",
                     )
                     .weak(),
                 );
@@ -176,21 +176,63 @@ fn route_editor(ui: &mut egui::Ui, r: &mut MockRoute, root: bool) -> bool {
             ui.label(RichText::new("（未選択なら全てのメソッドを受け付けます）").weak());
         }
     });
-    ui.label(RichText::new("レスポンスヘッダ（1 行に「名前: 値」。Content-Length は Body から付けます）").weak());
+    ui.horizontal(|ui| {
+        ui.label("Content-Type");
+        let selected = CONTENT_TYPES.iter().find(|(_, v, _)| *v == r.content_type);
+        let text = match selected {
+            Some((label, "", _)) => label.to_string(),
+            Some((label, v, _)) => format!("{label}（{v}）"),
+            None => r.content_type.clone(),
+        };
+        egui::ComboBox::from_id_salt("content_type").selected_text(text).width(320.0).show_ui(ui, |ui| {
+            for (label, v, _) in CONTENT_TYPES {
+                let item = if v.is_empty() { label.to_string() } else { format!("{label}（{v}）") };
+                ui.selectable_value(&mut r.content_type, v.to_string(), item);
+            }
+        });
+        ui.label(RichText::new(if r.uses_file() { "Body はファイル" } else { "Body は手書き" }).weak());
+    });
+    ui.label(RichText::new("レスポンスヘッダ（1 行に「名前: 値」。Content-Length は Body から付けます。Content-Type を書くとそちらを優先します）").weak());
     ui.add(
         egui::TextEdit::multiline(&mut r.headers)
-            .hint_text("Content-Type: application/json")
+            .hint_text("Cache-Control: no-store")
             .desired_rows(2)
             .desired_width(f32::INFINITY)
             .font(egui::TextStyle::Monospace),
     );
-    ui.label(RichText::new("Body").weak());
-    ui.add(
-        egui::TextEdit::multiline(&mut r.body)
-            .hint_text("{\"q\": \"{{json:query.q}}\", \"name\": \"{{json:form.name}}\"}")
-            .desired_rows(5)
-            .desired_width(f32::INFINITY)
-            .font(egui::TextStyle::Monospace),
-    );
+    if r.uses_file() {
+        ui.label(RichText::new("Body（ファイルの中身をそのまま返します。応答のたびに読むので差し替えるとすぐ反映され、zip エクスポートには含まれません）").weak());
+        ui.horizontal(|ui| {
+            if ui.button("ファイルを選択…").clicked() {
+                let mut dialog = rfd::FileDialog::new().set_title("Body にするファイルを選択");
+                if let Some(dir) = std::path::Path::new(r.file.trim()).parent().filter(|d| d.is_dir()) {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(path) = dialog.pick_file() {
+                    r.file = path.display().to_string();
+                    // 拡張子から種類が分かれば合わせる（バイナリなどを選んでいたときも）
+                    if let Some(ct) = MockRoute::content_type_for_file(&r.file) {
+                        r.content_type = ct.to_string();
+                    }
+                }
+            }
+            if r.file.trim().is_empty() {
+                ui.label(RichText::new("（未選択）").weak());
+            } else {
+                let size = std::fs::metadata(r.file.trim()).map(|m| format!("{} バイト", m.len())).unwrap_or_default();
+                ui.label(RichText::new(r.file.trim()).monospace());
+                ui.label(RichText::new(size).weak());
+            }
+        });
+    } else {
+        ui.label(RichText::new("Body").weak());
+        ui.add(
+            egui::TextEdit::multiline(&mut r.body)
+                .hint_text("{\"q\": \"{{json:query.q}}\", \"name\": \"{{json:form.name}}\"}")
+                .desired_rows(5)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+    }
     delete
 }

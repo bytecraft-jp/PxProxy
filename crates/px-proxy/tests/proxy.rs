@@ -697,8 +697,9 @@ async fn mock_server_answers_without_upstream() {
         path: path.into(),
         methods: methods.into(),
         status,
-        headers: "Content-Type: application/json".into(),
+        content_type: "application/json".into(),
         body: body.into(),
+        ..Default::default()
     };
     let mock = MockServer {
         enabled: true,

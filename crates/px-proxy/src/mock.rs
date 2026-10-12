@@ -8,6 +8,26 @@ use crate::rules::glob;
 /// 必ず用意するパス
 pub const ROOT_PATH: &str = "/";
 
+/// 選べる Content-Type（表示名, 値, Body をファイルから読むか）。
+/// テキストの種類は Body を手書きし、画像・バイナリはファイルを選ぶ。
+pub const CONTENT_TYPES: &[(&str, &str, bool)] = &[
+    ("HTML", "text/html; charset=utf-8", false),
+    ("JSON", "application/json", false),
+    ("CSS", "text/css; charset=utf-8", false),
+    ("JavaScript", "text/javascript; charset=utf-8", false),
+    ("XML", "application/xml", false),
+    ("テキスト", "text/plain; charset=utf-8", false),
+    ("画像 PNG", "image/png", true),
+    ("画像 JPEG", "image/jpeg", true),
+    ("画像 GIF", "image/gif", true),
+    ("画像 WebP", "image/webp", true),
+    ("画像 SVG", "image/svg+xml", true),
+    ("画像 ICO", "image/x-icon", true),
+    ("PDF", "application/pdf", true),
+    ("バイナリ", "application/octet-stream", true),
+    ("指定しない", "", false),
+];
+
 /// 1 つのダミーサーバ。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -34,9 +54,16 @@ pub struct MockRoute {
     /// 受け付けるメソッド（空白・カンマ区切り、空なら全て）
     pub methods: String,
     pub status: u16,
+    /// Content-Type（空なら付けない）。ヘッダに Content-Type があればそちらを優先する。
+    /// 項目が無い古い設定はヘッダで指定していたので空にする
+    #[serde(default)]
+    pub content_type: String,
     /// レスポンスヘッダ（1 行に `名前: 値`）。Content-Length は Body から付ける
     pub headers: String,
+    /// 手書きの Body（テキストの Content-Type のとき）
     pub body: String,
+    /// Body にするファイルのパス（画像・バイナリの Content-Type のとき）。応答のたびに読む
+    pub file: String,
 }
 
 impl Default for MockRoute {
@@ -45,8 +72,10 @@ impl Default for MockRoute {
             path: ROOT_PATH.into(),
             methods: String::new(),
             status: 200,
-            headers: "Content-Type: text/html; charset=utf-8".into(),
+            content_type: CONTENT_TYPES[0].1.into(),
+            headers: String::new(),
             body: String::new(),
+            file: String::new(),
         }
     }
 }
@@ -59,6 +88,39 @@ impl MockRoute {
             .map(|m| m.trim().to_ascii_uppercase())
             .filter(|m| !m.is_empty())
             .collect()
+    }
+
+    /// Body をファイルから読むか（画像・音声・動画・フォントや、テキストでない application/*）。
+    pub fn uses_file(&self) -> bool {
+        let mime = self.content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+        if mime.is_empty() {
+            return false;
+        }
+        if let Some(&(_, _, file)) = CONTENT_TYPES.iter().find(|(_, v, _)| v.split(';').next() == Some(mime.as_str())) {
+            return file;
+        }
+        let text = mime.starts_with("text/")
+            || mime.ends_with("/json")
+            || mime.ends_with("+json")
+            || mime.ends_with("/xml")
+            || mime.ends_with("javascript")
+            || mime == "application/x-www-form-urlencoded";
+        !text
+    }
+
+    /// ファイルの拡張子に合う Content-Type（ファイルから読む種類のうち）。
+    pub fn content_type_for_file(path: &str) -> Option<&'static str> {
+        let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
+        Some(match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "ico" => "image/x-icon",
+            "pdf" => "application/pdf",
+            _ => return None,
+        })
     }
 
     fn accepts(&self, method: &str) -> bool {
@@ -111,6 +173,14 @@ impl MockServer {
                     out.push(format!("{path}: ヘッダは「名前: 値」の形で書いてください: {line}"));
                 }
             }
+            if r.uses_file() {
+                let file = r.file.trim();
+                if file.is_empty() {
+                    out.push(format!("{path}: Body のファイルを選択してください"));
+                } else if !std::path::Path::new(file).is_file() {
+                    out.push(format!("{path}: Body のファイルがありません: {file}"));
+                }
+            }
         }
         out
     }
@@ -118,19 +188,35 @@ impl MockServer {
     /// リクエストへの応答を作る。一致するパスが無ければ 404、パスはあるがメソッドが違えば 405。
     /// ヘッダと Body の `{{…}}` はリクエストの内容で置き換える。
     pub(crate) fn respond(&self, req: &MockRequest<'_>) -> MockResponse {
+        const TEXT: &str = "Content-Type: text/plain; charset=utf-8";
         let (method, path) = (req.method, req.path());
         let mut allowed: Vec<String> = Vec::new();
         for r in self.routes.iter().filter(|r| r.matches_path(path)) {
             if r.accepts(method) {
+                let mut headers = String::new();
+                let content_type = r.content_type.trim();
+                if !content_type.is_empty() && !header_lines(&r.headers).any(|l| header_name(l).eq_ignore_ascii_case("content-type")) {
+                    headers = format!("Content-Type: {content_type}\n");
+                }
                 // 置き換えた値に改行があってもヘッダの枠を壊さないよう、行ごとに置き換えて改行を除く
-                let headers: String = header_lines(&r.headers)
-                    .map(|l| String::from_utf8_lossy(&render(l, req)).replace(['\r', '\n'], "") + "\n")
-                    .collect();
-                return MockResponse::build(method, r.status, &headers, &render(&r.body, req));
+                headers.extend(header_lines(&r.headers).map(|l| String::from_utf8_lossy(&render(l, req)).replace(['\r', '\n'], "") + "\n"));
+                // ファイルはバイト列のまま返す（プレースホルダは置き換えない）
+                let body = if r.uses_file() {
+                    let file = r.file.trim();
+                    match std::fs::read(file) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let body = format!("pxproxy ダミーサーバ: {path} の Body のファイルを読めません: {file}: {e}\n");
+                            return MockResponse::build(method, 500, TEXT, body.as_bytes());
+                        }
+                    }
+                } else {
+                    render(&r.body, req)
+                };
+                return MockResponse::build(method, r.status, &headers, &body);
             }
             allowed.extend(r.method_list());
         }
-        const TEXT: &str = "Content-Type: text/plain; charset=utf-8";
         if allowed.is_empty() {
             let body = format!("pxproxy ダミーサーバ: {path} はありません\n");
             return MockResponse::build(method, 404, TEXT, body.as_bytes());
@@ -326,6 +412,10 @@ fn header_lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines().map(str::trim).filter(|l| !l.is_empty())
 }
 
+fn header_name(line: &str) -> &str {
+    line.split_once(':').map_or("", |(name, _)| name.trim())
+}
+
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -363,7 +453,15 @@ mod tests {
     use super::*;
 
     fn route(path: &str, methods: &str, status: u16, body: &str) -> MockRoute {
-        MockRoute { path: path.into(), methods: methods.into(), status, headers: "X-Mock: 1".into(), body: body.into() }
+        MockRoute {
+            path: path.into(),
+            methods: methods.into(),
+            status,
+            content_type: String::new(),
+            headers: "X-Mock: 1".into(),
+            body: body.into(),
+            file: String::new(),
+        }
     }
 
     fn server() -> MockServer {
@@ -438,6 +536,50 @@ mod tests {
         let echo = MockServer { routes: vec![MockRoute { body: "{{body}}".into(), ..Default::default() }], ..server() };
         let req = MockRequest { method: "POST", target: "/", headers: &[], body: &[0xff, 0x00] };
         assert_eq!(echo.respond(&req).body, [0xff, 0x00], "Body はバイト列のまま返す");
+    }
+
+    #[test]
+    fn content_type_and_file_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', 0x00, 0xff]).unwrap();
+
+        let json = MockRoute { content_type: "application/json".into(), body: "{\"q\":\"{{query.q}}\"}".into(), ..Default::default() };
+        let s = MockServer { routes: vec![json], ..server() };
+        let (_, head, body) = text(&call(&s, "GET", "/?q=1"));
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"), "{head}");
+        assert_eq!(body, "{\"q\":\"1\"}");
+
+        // ヘッダの Content-Type が優先（古い設定はヘッダで指定している）
+        let old = MockRoute { headers: "content-type: text/plain".into(), body: "x".into(), ..Default::default() };
+        let (_, head, _) = text(&call(&MockServer { routes: vec![old], ..server() }, "GET", "/"));
+        assert_eq!(head, "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nContent-Length: 1\r\n\r\n");
+
+        // 画像はファイルをバイト列のまま返す（手書きの Body は使わない）
+        let image = MockRoute { content_type: "image/png".into(), body: "unused".into(), file: png.display().to_string(), ..Default::default() };
+        assert!(image.uses_file());
+        let s = MockServer { routes: vec![image.clone()], ..server() };
+        assert!(s.problems().is_empty(), "{:?}", s.problems());
+        let r = call(&s, "GET", "/");
+        assert!(String::from_utf8_lossy(&r.head).contains("Content-Type: image/png\r\nContent-Length: 6\r\n"));
+        assert_eq!(r.body, [0x89, b'P', b'N', b'G', 0x00, 0xff]);
+
+        // ファイルが無ければ設定の誤りとして出し、応答は 500
+        let missing = MockRoute { content_type: "application/octet-stream".into(), file: dir.path().join("none.bin").display().to_string(), ..image };
+        let s = MockServer { routes: vec![missing], ..server() };
+        assert_eq!(s.problems().len(), 1, "{:?}", s.problems());
+        assert_eq!(call(&s, "GET", "/").status, 500);
+
+        let kind = |ct: &str| MockRoute { content_type: ct.into(), ..Default::default() }.uses_file();
+        assert!(!kind("") && !kind("text/csv") && !kind("application/problem+json") && !kind("application/json; charset=utf-8"));
+        assert!(kind("image/avif") && kind("font/woff2") && kind("application/zip") && kind("image/svg+xml"));
+        assert_eq!(MockRoute::content_type_for_file(r"C:\x\Logo.JPG"), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn old_settings_keep_content_type_in_headers() {
+        let r: MockRoute = serde_json::from_str(r#"{"path": "/", "headers": "Content-Type: application/json"}"#).unwrap();
+        assert_eq!((r.content_type.as_str(), r.status), ("", 200), "項目が無ければ Content-Type は付けない");
     }
 
     #[test]
