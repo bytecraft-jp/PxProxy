@@ -5,7 +5,9 @@ mod cli;
 mod codec;
 mod diff;
 mod fonts;
+mod graphql;
 mod highlight;
+mod protobuf;
 mod view;
 
 fn main() -> eframe::Result {

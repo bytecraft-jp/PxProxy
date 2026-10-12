@@ -29,6 +29,12 @@ impl Findings {
     pub(super) fn clear(&mut self) {
         *self = Self { dirty: true, ..Self::default() };
     }
+
+    /// 間隔を待たずに次の描画で読み直す。
+    pub(super) fn reload(&mut self) {
+        self.dirty = true;
+        self.loaded_at = None;
+    }
 }
 
 impl PxApp {
@@ -98,7 +104,7 @@ impl PxApp {
                 if last != Some(g.severity) {
                     last = Some(g.severity);
                     ui.add_space(4.0);
-                    ui.label(RichText::new(format!("重要度: {}", g.severity.label())).color(super::severity_color(g.severity)).strong());
+                    ui.label(RichText::new(format!("重要度: {}", g.severity.label())).color(super::severity_color(ui, g.severity)).strong());
                 }
                 let title = passive::check(&g.check).map_or(g.check.as_str(), |c| c.title);
                 let is_sel = f.selected.as_ref().is_some_and(|(c, h)| *c == g.check && *h == g.host);
@@ -130,7 +136,7 @@ impl PxApp {
         let check = passive::check(&check_id);
         ui.horizontal(|ui| {
             if let Some(c) = check {
-                ui.label(RichText::new(format!("[{}]", c.severity.label())).color(super::severity_color(c.severity)).strong());
+                ui.label(RichText::new(format!("[{}]", c.severity.label())).color(super::severity_color(ui, c.severity)).strong());
                 ui.heading(c.title);
             } else {
                 ui.heading(&check_id);

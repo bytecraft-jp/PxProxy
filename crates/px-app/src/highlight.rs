@@ -96,6 +96,8 @@ pub fn layout_job(
         Syntax::Json => json(&mut spans, body, body_start),
         Syntax::Html => markup(&mut spans, body, body_start, true),
         Syntax::Xml => markup(&mut spans, body, body_start, false),
+        Syntax::Graphql => graphql(&mut spans, body, body_start),
+        Syntax::Protobuf => protobuf(&mut spans, body, body_start),
         Syntax::Plain => {}
     }
     spans.mark(text.len()..text.len(), Tok::Plain);
@@ -214,6 +216,118 @@ fn json(spans: &mut Spans, body: &str, base: usize) {
                 spans.mark(base + start..base + i, Tok::Punct);
             }
             _ => i += 1,
+        }
+    }
+}
+
+/// 文字列リテラル（`"…"`、エスケープを飛ばす）の終わりの次の位置。行末で閉じていなければ行末まで。
+fn string_end(b: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    let mut escaped = false;
+    while i < b.len() {
+        let c = b[i];
+        i += 1;
+        if escaped {
+            escaped = false;
+        } else if c == b'\\' {
+            escaped = true;
+        } else if c == b'"' || c == b'\n' {
+            break;
+        }
+    }
+    i
+}
+
+fn is_name_byte(c: &u8) -> bool {
+    c.is_ascii_alphanumeric() || *c == b'_'
+}
+
+/// GraphQL（整形表示の variables の JSON も同じ規則で色を付ける）。
+fn graphql(spans: &mut Spans, body: &str, base: usize) {
+    const KEYWORDS: &[&str] = &["query", "mutation", "subscription", "fragment", "on", "true", "false", "null"];
+    let b = body.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        match b[i] {
+            b'#' => {
+                i += b[i..].iter().position(|&c| c == b'\n').unwrap_or(b.len() - i);
+                spans.mark(base + start..base + i, Tok::Comment);
+            }
+            b'"' if body[i..].starts_with("\"\"\"") => {
+                i = body[i + 3..].find("\"\"\"").map_or(b.len(), |p| i + 3 + p + 3);
+                spans.mark(base + start..base + i, Tok::Str);
+            }
+            b'"' => {
+                i = string_end(b, i);
+                let next = b[i..].iter().find(|c| !c.is_ascii_whitespace());
+                spans.mark(base + start..base + i, if next == Some(&b':') { Tok::Key } else { Tok::Str });
+            }
+            b'$' | b'@' => {
+                i += 1 + b[i + 1..].iter().take_while(|c| is_name_byte(c)).count();
+                spans.mark(base + start..base + i, if b[start] == b'$' { Tok::Key } else { Tok::Attr });
+            }
+            b'-' | b'0'..=b'9' => {
+                i += 1 + b[i + 1..].iter().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'+' | b'-')).count();
+                spans.mark(base + start..base + i, Tok::Num);
+            }
+            c if is_name_byte(&c) => {
+                i += b[i..].iter().take_while(|c| is_name_byte(c)).count();
+                let name = &body[start..i];
+                let next = b[i..].iter().find(|c| !c.is_ascii_whitespace());
+                if KEYWORDS.contains(&name) {
+                    spans.mark(base + start..base + i, Tok::Literal);
+                } else if next == Some(&b':') {
+                    // 引数名・別名
+                    spans.mark(base + start..base + i, Tok::Attr);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// Protobuf のデコード結果（`1: 150`・`2 {`・`3: "text"`・`4: <hex>`・`# 注記`）。
+fn protobuf(spans: &mut Spans, body: &str, base: usize) {
+    let mut next_line = 0;
+    for line in body.split_inclusive('\n') {
+        let line_base = base + next_line;
+        next_line += line.len();
+        let content = line.trim_end_matches(['\r', '\n']);
+        let b = content.as_bytes();
+        let mut i = b.iter().take_while(|c| **c == b' ').count();
+        if b.get(i) == Some(&b'#') {
+            spans.mark(line_base + i..line_base + b.len(), Tok::Comment);
+            continue;
+        }
+        let digits = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
+            continue;
+        }
+        spans.mark(line_base + i..line_base + i + digits, Tok::Key);
+        i += digits;
+        if !content[i..].starts_with(": ") {
+            continue;
+        }
+        i += 2;
+        let start = i;
+        let tok = match b.get(i) {
+            Some(b'"') => {
+                i = string_end(b, i);
+                Tok::Str
+            }
+            Some(b'<') => {
+                i = content[i..].find('>').map_or(b.len(), |p| i + p + 1);
+                Tok::Literal
+            }
+            _ => {
+                i += b[i..].iter().take_while(|c| !c.is_ascii_whitespace()).count();
+                Tok::Num
+            }
+        };
+        spans.mark(line_base + start..line_base + i, tok);
+        if let Some(p) = content[i..].find("  # ") {
+            spans.mark(line_base + i + p + 2..line_base + b.len(), Tok::Comment);
         }
     }
 }
@@ -339,6 +453,51 @@ mod tests {
             ("</script>", Tok::Tag),
         ];
         assert_eq!(t, want.map(|(s, k)| (s.to_string(), k)));
+    }
+
+    #[test]
+    fn graphql_and_protobuf_tokens() {
+        let mut spans = Spans::default();
+        let q = "query Q($id: ID!) { u: user(id: $id) @skip(if: false) { n } } # c\n{\"id\": 1}";
+        graphql(&mut spans, q, 0);
+        let t: Vec<_> = spans.0.into_iter().filter(|(_, t)| *t != Tok::Plain).map(|(r, t)| (&q[r], t)).collect();
+        assert_eq!(
+            t,
+            [
+                ("query", Tok::Literal),
+                ("$id", Tok::Key),
+                ("u", Tok::Attr),
+                ("id", Tok::Attr),
+                ("$id", Tok::Key),
+                ("@skip", Tok::Attr),
+                ("if", Tok::Attr),
+                ("false", Tok::Literal),
+                ("# c", Tok::Comment),
+                ("\"id\"", Tok::Key),
+                ("1", Tok::Num),
+            ]
+        );
+
+        let mut spans = Spans::default();
+        let p = "# メッセージ 1\n1: 150\n2 {\n  3: \"a\\\"b\"\n  4: <ff00>\n}\n5: 18446744073709551615  # -1\n";
+        protobuf(&mut spans, p, 0);
+        let t: Vec<_> = spans.0.into_iter().filter(|(_, t)| *t != Tok::Plain).map(|(r, t)| (&p[r], t)).collect();
+        assert_eq!(
+            t,
+            [
+                ("# メッセージ 1", Tok::Comment),
+                ("1", Tok::Key),
+                ("150", Tok::Num),
+                ("2", Tok::Key),
+                ("3", Tok::Key),
+                ("\"a\\\"b\"", Tok::Str),
+                ("4", Tok::Key),
+                ("<ff00>", Tok::Literal),
+                ("5", Tok::Key),
+                ("18446744073709551615", Tok::Num),
+                ("# -1", Tok::Comment),
+            ]
+        );
     }
 
     #[test]

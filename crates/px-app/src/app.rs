@@ -1,41 +1,47 @@
 mod comparer_tab;
 mod detail;
+mod filter_bar;
 mod findings_tab;
 mod intercept_tab;
 mod mock_tab;
+mod prefs;
 mod repeater_tab;
+mod rows;
 mod settings_tab;
 mod sitemap_tab;
 #[cfg(test)]
 mod smoke_tests;
 mod tasks;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
 use px_proxy::{CertAuthority, Held, ProjectSettings, ProxyContext, ProxyServer};
-use px_store::{
-    ALL_KINDS, ALL_STATUS, CommitHook, Filter, FlowKind, FlowSource, FlowSummary, Project, Reader, Severity, StatusClass,
-};
+use px_store::{CommitHook, Filter, FlowSource, FlowSummary, Highlight, Project, Reader, Severity};
 
 use crate::view;
 use comparer_tab::Comparer;
 use detail::{CodecWindow, Detail, Search, Selection, ViewMode};
+use filter_bar::FilterForm;
 use findings_tab::Findings;
 use intercept_tab::Editor;
+use prefs::UiPrefs;
 use repeater_tab::Repeater;
+use rows::{DeleteRequest, RowAction};
 use sitemap_tab::SiteMap;
 use tasks::BgTask;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 const SUMMARY_CACHE_MAX: usize = 20_000;
+/// 本文検索で 1 フレームに使う時間（超えた分は次のフレームで続ける）
+const SCAN_BUDGET: Duration = Duration::from_millis(25);
 const RECENT_MAX: usize = 10;
 const RED: Color32 = Color32::from_rgb(230, 80, 80);
 const GREEN: Color32 = Color32::from_rgb(80, 200, 120);
@@ -122,15 +128,29 @@ pub struct PxApp {
 
     /// フィルタバーの条件
     filter: Filter,
+    /// フィルタバーの数値の入力欄
+    filter_form: FilterForm,
     /// 一覧に適用中の条件（フィルタバー + サイトマップで選んだノード）。`ids` はこの条件の結果
     applied: Filter,
     /// 現在のフィルタに一致する ID（昇順）。行 i は ids[i]。
     ids: Vec<i64>,
+    /// この ID まで調べた（次はこれより後を取りに行く）
     last_id: i64,
+    /// 本文検索の途中（記録済みの通信を調べ終えていない）
+    scanning: bool,
     total: i64,
     cache: HashMap<i64, FlowSummary>,
     follow: bool,
+    /// 詳細を表示している行
     selected: Option<i64>,
+    /// 一覧で選んだ行（Ctrl / Shift で複数）。色付け・削除の対象
+    picked: BTreeSet<i64>,
+    /// Shift で範囲を選ぶときの起点
+    anchor: Option<i64>,
+    /// 確認待ちの削除
+    confirm_delete: Option<DeleteRequest>,
+    /// 書き込み待ちの削除（その削除で消える ID の 1 つ）。消えたらサイトマップと検出を読み直す
+    pending_deletes: Vec<i64>,
     scroll_to: Option<usize>,
     detail: Option<Detail>,
     /// 詳細ペインの希望の表示方法 [Request, Response]
@@ -157,6 +177,8 @@ pub struct PxApp {
     site_map: SiteMap,
     findings: Findings,
     comparer: Comparer,
+    /// テーマ・文字の大きさ
+    prefs: UiPrefs,
 
     status: String,
 }
@@ -168,6 +190,8 @@ impl PxApp {
         let ctx = ProxyContext::new(ca)?;
         let repaint = egui_ctx.clone();
         ctx.interceptor().set_notify(Some(Arc::new(move || repaint.request_repaint())));
+        let prefs = UiPrefs::load();
+        prefs.apply(&egui_ctx);
         let mut app = Self {
             rt,
             ctx,
@@ -180,13 +204,19 @@ impl PxApp {
             recent: load_recent(),
             new_project: None,
             filter: Filter::default(),
+            filter_form: FilterForm::default(),
             applied: Filter::default(),
             ids: Vec::new(),
             last_id: 0,
+            scanning: false,
             total: 0,
             cache: HashMap::new(),
             follow: true,
             selected: None,
+            picked: BTreeSet::new(),
+            anchor: None,
+            confirm_delete: None,
+            pending_deletes: Vec::new(),
             scroll_to: None,
             detail: None,
             view_pref: [ViewMode::Pretty; 2],
@@ -207,6 +237,7 @@ impl PxApp {
             site_map: SiteMap::default(),
             findings: Findings::default(),
             comparer: Comparer::default(),
+            prefs,
             status: "案件を作成するか、既存の案件を開いてください".into(),
         };
         app.apply_launch(opts);
@@ -282,6 +313,8 @@ impl PxApp {
         self.forget_detail_images();
         self.detail = None;
         self.selected = None;
+        self.confirm_delete = None;
+        self.pending_deletes.clear();
         self.site_map = SiteMap::default();
         self.findings.clear();
         for uri in self.comparer.image_uris() {
@@ -309,6 +342,10 @@ impl PxApp {
         self.ids.clear();
         self.cache.clear();
         self.last_id = 0;
+        self.scanning = false;
+        // 見えなくなった行を選んだまま削除しないように、選択は外す
+        self.picked.clear();
+        self.anchor = None;
         self.dirty.store(true, Ordering::Release);
     }
 
@@ -323,31 +360,43 @@ impl PxApp {
 
     fn refresh(&mut self) {
         let wanted = self.effective_filter();
-        if wanted != self.applied {
+        // 正規表現の誤りなどで使えない条件は適用しない（フィルタバーに理由を出す）
+        if wanted != self.applied && wanted.error().is_none() {
             self.applied = wanted;
             self.reset_list();
         }
-        if !self.dirty.swap(false, Ordering::AcqRel) {
+        let committed = self.dirty.swap(false, Ordering::AcqRel);
+        if !committed && !self.scanning {
             return;
         }
-        let Some(reader) = &self.reader else { return };
-        match reader.ids_after(self.last_id, &self.applied) {
-            Ok(new) => {
-                if let Some(&last) = new.last() {
-                    self.last_id = last;
+        let Some(reader) = self.reader.take() else { return };
+        // 本文検索は Body を読んで展開するので、1 フレームに使う時間を決めて少しずつ進める
+        match reader.scan_after(self.last_id, &self.applied, Some(Instant::now() + SCAN_BUDGET)) {
+            Ok(scan) => {
+                self.last_id = scan.upto;
+                self.ids.extend(scan.ids);
+                self.scanning = !scan.complete;
+                if self.scanning {
+                    self.egui_ctx.request_repaint();
                 }
-                self.ids.extend(new);
             }
-            Err(e) => self.status = format!("読み込みエラー: {e}"),
+            Err(e) => {
+                self.scanning = false;
+                self.status = format!("読み込みエラー: {e}");
+            }
         }
-        self.total = reader.count().unwrap_or(self.total);
-        if let Err(e) = self.site_map.update(reader) {
-            self.status = format!("サイトマップの読み込みエラー: {e}");
+        if committed {
+            self.total = reader.count().unwrap_or(self.total);
+            self.finish_deletes(&reader);
+            if let Err(e) = self.site_map.update(&reader) {
+                self.status = format!("サイトマップの読み込みエラー: {e}");
+            }
+            self.findings.dirty = true;
+            if let Some(d) = &mut self.detail {
+                d.refresh_ws(&reader);
+            }
         }
-        self.findings.dirty = true;
-        if let Some(d) = &mut self.detail {
-            d.refresh_ws(reader);
-        }
+        self.reader = Some(reader);
     }
 
     fn create_project(&mut self, target: PathBuf) {
@@ -463,7 +512,26 @@ impl PxApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.ids.is_empty() || self.new_project.is_some() || !self.tab.has_list() {
+        if ctx.egui_wants_keyboard_input()
+            || self.ids.is_empty()
+            || self.new_project.is_some()
+            || self.confirm_delete.is_some()
+            || !self.tab.has_list()
+        {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&rows::SELECT_ALL_KEY)) {
+            self.select_all_rows();
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            let ids: Vec<i64> = match (self.picked.is_empty(), self.selected) {
+                (false, _) => self.picked.iter().copied().collect(),
+                (true, Some(id)) => vec![id],
+                (true, None) => return,
+            };
+            let what = if ids.len() == 1 { "この通信".to_string() } else { format!("選択した {} 件", ids.len()) };
+            self.request_delete(ids, what);
             return;
         }
         let (up, down) = ctx.input(|i| (i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown)));
@@ -478,6 +546,7 @@ impl PxApp {
         };
         self.follow = false;
         self.scroll_to = Some(next);
+        self.pick_only(self.ids[next]);
         self.select(self.ids[next]);
     }
 
@@ -523,10 +592,19 @@ impl PxApp {
                     self.menu_import();
                 }
                 ui.separator();
+                if ui
+                    .add_enabled(has_project, egui::Button::new("診断対象外の通信を削除…"))
+                    .on_hover_text("「診断対象 / ルール」の設定で判定します（確認してから削除します）")
+                    .clicked()
+                {
+                    self.request_delete_out_of_scope();
+                }
+                ui.separator();
                 if ui.add_enabled(has_project, egui::Button::new("案件を閉じる")).clicked() {
                     self.close_project();
                 }
             });
+            ui.menu_button("表示", |ui| self.view_menu(ui));
             ui.menu_button("CA", |ui| {
                 if ui.button("CA 証明書を保存…").clicked() {
                     self.menu_save_ca();
@@ -563,7 +641,7 @@ impl PxApp {
             ui.separator();
             let intercepting = self.ctx.interceptor().is_enabled();
             let (label, color) =
-                if intercepting { ("Intercept: ON", YELLOW) } else { ("Intercept: OFF", Color32::GRAY) };
+                if intercepting { ("Intercept: ON", yellow(ui)) } else { ("Intercept: OFF", Color32::GRAY) };
             let resp = ui
                 .add_enabled(has_project, egui::Button::new(RichText::new(label).color(color)))
                 .on_hover_text("ルールに一致した通信を止めて編集できます（設定タブで条件を変更）");
@@ -589,6 +667,15 @@ impl PxApp {
                     } else {
                         ui.label(format!("{} / {} 件", self.ids.len(), self.total));
                     }
+                    if self.scanning {
+                        ui.label(RichText::new(format!("本文を検索中… #{} まで", self.last_id)).weak());
+                        ui.spinner();
+                    }
+                    if self.picked.len() > 1 {
+                        ui.separator();
+                        ui.label(format!("{} 件を選択中", self.picked.len()))
+                            .on_hover_text("右クリックで色付け・削除（Ctrl+クリックで追加 / 解除、Shift+クリックで範囲、Ctrl+A ですべて）");
+                    }
                 }
             });
         });
@@ -598,7 +685,7 @@ impl PxApp {
         ui.horizontal(|ui| {
             let n = self.held.len();
             let intercept = if n > 0 {
-                RichText::new(format!("Intercept ({n})")).color(YELLOW).strong()
+                RichText::new(format!("Intercept ({n})")).color(yellow(ui)).strong()
             } else {
                 RichText::new("Intercept")
             };
@@ -629,56 +716,24 @@ impl PxApp {
         });
     }
 
-    fn filter_bar(&mut self, ui: &mut egui::Ui) {
-        let mut f = self.filter.clone();
-        ui.horizontal_wrapped(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut f.text).hint_text("🔍 ホスト / パスで絞り込み").desired_width(180.0),
-            );
-            ui.separator();
-            ui.label("種類");
-            for k in FlowKind::ALL {
-                chip(ui, &mut f.kinds, k.bit(), k.label());
-            }
-            ui.separator();
-            ui.label("ステータス");
-            for s in StatusClass::ALL {
-                chip(ui, &mut f.status, s.bit(), s.label());
-            }
-            ui.separator();
-            ui.toggle_value(&mut f.in_scope_only, "診断対象のみ")
-                .on_hover_text("「診断対象 / ルール」タブで設定したホスト・パスだけを表示");
-            ui.separator();
-            if ui.button("リセット").on_hover_text("すべて表示").clicked() {
-                f = Filter::default();
-            }
-            if ui.button("静的ファイルを隠す").on_hover_text("JS / CSS / 画像 / フォント / メディアを非表示").clicked() {
-                f.kinds = ALL_KINDS
-                    & !(FlowKind::Script.bit()
-                        | FlowKind::Css.bit()
-                        | FlowKind::Image.bit()
-                        | FlowKind::Font.bit()
-                        | FlowKind::Media.bit());
-            }
-            if ui.button("XHR のみ").clicked() {
-                f.kinds = FlowKind::Xhr.bit();
-            }
-            if ui.button("エラーのみ").on_hover_text("4xx / 5xx / 応答なし").clicked() {
-                f.status = ALL_STATUS & !(StatusClass::Ok.bit() | StatusClass::Redirect.bit());
-            }
-        });
-        self.filter = f;
-    }
-
+    /// 左にメッセージ、右に CA の場所。重ならないよう右を先に置き（幅の 4 割まで）、
+    /// 左は残りの幅に収まらなければ末尾を省略する。省略した全文はマウスを乗せると出す。
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            self.task_status(ui);
-            ui.label(RichText::new(&self.status).small());
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let ca = CertAuthority::default_dir().join("ca.crt");
-                ui.label(RichText::new(format!("CA: {}", ca.display())).small().weak());
-            });
-        });
+        let ca = format!("CA: {}", CertAuthority::default_dir().join("ca.crt").display());
+        let ca_max = ui.available_width() * 0.4;
+        egui::Sides::new().shrink_left().truncate().show(
+            ui,
+            |ui| {
+                self.task_status(ui);
+                ui.add(egui::Label::new(RichText::new(&self.status).small())).on_hover_text(&self.status);
+            },
+            |ui| {
+                ui.scope(|ui| {
+                    ui.set_max_width(ca_max);
+                    ui.add(egui::Label::new(RichText::new(&ca).small().weak()).truncate()).on_hover_text(&ca);
+                });
+            },
+        );
     }
 
     // ---- UI: 中央 ---------------------------------------------------------
@@ -827,7 +882,11 @@ impl PxApp {
         let cache = &mut self.cache;
         let reader = self.reader.as_ref();
         let selected = self.selected;
-        let mut clicked = None;
+        let picked = &self.picked;
+        let shown = ids.len();
+        // (行, クリックしたときの修飾キー)
+        let mut clicked: Option<(i64, egui::Modifiers)> = None;
+        let mut row_action: Option<RowAction> = None;
         let mut scope_add: Option<(String, bool)> = None;
         let mut passthrough_add: Option<String> = None;
         let mut to_repeater = None;
@@ -865,14 +924,18 @@ impl PxApp {
                         e.insert(s);
                     }
                     let Some(s) = cache.get(&id) else { return };
-                    row.set_selected(selected == Some(id));
+                    row.set_selected(selected == Some(id) || picked.contains(&id));
+                    let tint = s.color.map(row_tint);
                     row.col(|ui| {
+                        tint_cell(ui, tint);
                         ui.label(RichText::new(id.to_string()).weak());
                     });
                     row.col(|ui| {
+                        tint_cell(ui, tint);
                         ui.label(view::format_time_short(s.started_at_us)).on_hover_text(view::format_datetime(s.started_at_us));
                     });
                     row.col(|ui| {
+                        tint_cell(ui, tint);
                         let default_port = if s.scheme == "https" { 443 } else { 80 };
                         let host = if s.port == default_port {
                             format!("{}://{}", s.scheme, s.host)
@@ -882,37 +945,46 @@ impl PxApp {
                         ui.add(egui::Label::new(host).truncate());
                     });
                     row.col(|ui| {
+                        tint_cell(ui, tint);
                         ui.label(&s.method);
                     });
                     row.col(|ui| {
+                        tint_cell(ui, tint);
                         ui.add(egui::Label::new(&s.target).truncate());
                     });
-                    row.col(|ui| match s.status {
-                        _ if s.source == FlowSource::Tunnel && s.error.is_none() => {
-                            ui.label(RichText::new("—").weak());
-                        }
-                        Some(code) => {
-                            ui.label(RichText::new(code.to_string()).color(status_color(code)));
-                        }
-                        None => {
-                            ui.label(RichText::new("ERR").color(RED));
+                    row.col(|ui| {
+                        tint_cell(ui, tint);
+                        match s.status {
+                            _ if s.source == FlowSource::Tunnel && s.error.is_none() => {
+                                ui.label(RichText::new("—").weak());
+                            }
+                            Some(code) => {
+                                ui.label(RichText::new(code.to_string()).color(status_color(code)));
+                            }
+                            None => {
+                                ui.label(RichText::new("ERR").color(RED));
+                            }
                         }
                     });
                     row.col(|ui| {
+                        tint_cell(ui, tint);
                         let r = ui.label(s.kind.label());
                         if let Some(ct) = &s.content_type {
                             r.on_hover_text(ct);
                         }
                     });
                     row.col(|ui| {
+                        tint_cell(ui, tint);
                         ui.label(view::human_size(s.res_body_len));
                     });
                     row.col(|ui| {
+                        tint_cell(ui, tint);
                         ui.label(format!("{}", s.duration_us / 1000));
                     });
                     row.col(|ui| {
+                        tint_cell(ui, tint);
                         if let Some(sev) = s.max_severity {
-                            ui.label(RichText::new("⚠").color(severity_color(sev)))
+                            ui.label(RichText::new("⚠").color(severity_color(ui, sev)))
                                 .on_hover_text(format!("パッシブチェックの検出あり（最大の重要度: {}）", sev.label()));
                         }
                         if let Some(e) = &s.error {
@@ -925,7 +997,7 @@ impl PxApp {
                                 px_store::EDITED_RESPONSE => "Res",
                                 _ => "Req/Res",
                             };
-                            ui.label(RichText::new(format!("編集済み ({what})")).color(YELLOW));
+                            ui.label(RichText::new(format!("編集済み ({what})")).color(yellow(ui)));
                         }
                         match s.source {
                             FlowSource::Repeater => {
@@ -943,28 +1015,31 @@ impl PxApp {
                             ui.label(RichText::new("WebSocket").color(Color32::from_rgb(100, 160, 240)));
                         }
                         if s.truncated != 0 {
-                            ui.label(RichText::new("一部のみ記録").color(YELLOW))
+                            ui.label(RichText::new("一部のみ記録").color(yellow(ui)))
                                 .on_hover_text("Body が記録の上限を超えたため、先頭だけを記録しました");
                         }
                     });
-                    let (_, note_cell) = row.col(|ui| match note_edit.as_mut().filter(|e| e.id == id) {
-                        Some(e) => {
-                            let r = ui.add(
-                                egui::TextEdit::singleline(&mut e.text)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("Enter で確定 / Esc で取消"),
-                            );
-                            if std::mem::take(&mut e.focus) {
-                                r.request_focus();
+                    let (_, note_cell) = row.col(|ui| {
+                        tint_cell(ui, tint);
+                        match note_edit.as_mut().filter(|e| e.id == id) {
+                            Some(e) => {
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(&mut e.text)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("Enter で確定 / Esc で取消"),
+                                );
+                                if std::mem::take(&mut e.focus) {
+                                    r.request_focus();
+                                }
+                                if r.lost_focus() {
+                                    let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                    note_done = Some((!cancel).then(|| (id, e.text.clone())));
+                                }
                             }
-                            if r.lost_focus() {
-                                let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                                note_done = Some((!cancel).then(|| (id, e.text.clone())));
-                            }
-                        }
-                        None => {
-                            if let Some(n) = &s.note {
-                                ui.add(egui::Label::new(n).truncate()).on_hover_text(n);
+                            None => {
+                                if let Some(n) = &s.note {
+                                    ui.add(egui::Label::new(n).truncate()).on_hover_text(n);
+                                }
                             }
                         }
                     });
@@ -973,7 +1048,7 @@ impl PxApp {
                     }
                     let resp = row.response();
                     if resp.clicked() {
-                        clicked = Some(id);
+                        clicked = Some((id, resp.ctx.input(|i| i.modifiers)));
                     }
                     resp.context_menu(|ui| {
                         if ui.button("Repeater に送る (Ctrl+R)").clicked() {
@@ -985,6 +1060,9 @@ impl PxApp {
                         if ui.button("メモを編集").clicked() {
                             note_start = Some(id);
                         }
+                        ui.separator();
+                        let targets = if picked.contains(&id) { picked.iter().copied().collect() } else { vec![id] };
+                        rows::row_menu(ui, &targets, shown, &mut row_action);
                         ui.separator();
                         ui.label(RichText::new(&s.host).strong());
                         if ui.button("このホストを診断対象に追加").clicked() {
@@ -1005,9 +1083,11 @@ impl PxApp {
                 });
             });
 
-        if let Some(id) = clicked {
-            self.follow = false;
-            self.select(id);
+        if let Some((id, modifiers)) = clicked {
+            self.click_row(id, modifiers);
+        }
+        if let Some(action) = row_action {
+            self.apply_row_action(action);
         }
         if let Some((host, exclude)) = scope_add {
             self.add_scope_host(&host, exclude);
@@ -1060,11 +1140,45 @@ fn chip(ui: &mut egui::Ui, mask: &mut u32, bit: u32, label: &str) {
     }
 }
 
-fn severity_color(s: Severity) -> Color32 {
+/// 行に付ける色。
+fn highlight_color(h: Highlight) -> Color32 {
+    match h {
+        Highlight::Red => Color32::from_rgb(230, 80, 80),
+        Highlight::Orange => Color32::from_rgb(240, 150, 50),
+        Highlight::Yellow => Color32::from_rgb(225, 200, 60),
+        Highlight::Green => Color32::from_rgb(80, 190, 110),
+        Highlight::Cyan => Color32::from_rgb(60, 190, 210),
+        Highlight::Blue => Color32::from_rgb(90, 140, 240),
+        Highlight::Purple => Color32::from_rgb(170, 110, 230),
+        Highlight::Gray => Color32::from_rgb(150, 150, 150),
+    }
+}
+
+/// 一覧の行の背景（選択・縞模様が透けるよう半透明にする）。
+fn row_tint(h: Highlight) -> Color32 {
+    highlight_color(h).gamma_multiply(0.35)
+}
+
+/// セルの背景を塗る。文字より先に呼ぶ。
+/// 列の間の隙間も塗るため、横方向だけセルの切り取り範囲の外まで描く（縦はスクロール範囲の切り取りに従う）。
+fn tint_cell(ui: &egui::Ui, tint: Option<Color32>) {
+    if let Some(c) = tint {
+        let rect = ui.max_rect().expand2(egui::vec2(ui.spacing().item_spacing.x / 2.0, 0.0));
+        let clip = egui::Rect::from_x_y_ranges(rect.x_range(), ui.clip_rect().y_range());
+        ui.ctx().layer_painter(ui.layer_id()).with_clip_rect(clip).rect_filled(rect, 0.0, c);
+    }
+}
+
+/// 注意を引く文字の黄色。ライトテーマでは白い背景で読めるよう濃くする。
+fn yellow(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode { YELLOW } else { Color32::from_rgb(170, 115, 0) }
+}
+
+fn severity_color(ui: &egui::Ui, s: Severity) -> Color32 {
     match s {
         Severity::High => RED,
         Severity::Medium => Color32::from_rgb(240, 140, 50),
-        Severity::Low => YELLOW,
+        Severity::Low => yellow(ui),
         Severity::Info => Color32::from_rgb(120, 160, 200),
     }
 }
@@ -1213,6 +1327,7 @@ impl eframe::App for PxApp {
         }
         self.new_project_window(&ctx);
         self.codec_window(&ctx);
+        self.delete_confirm_window(&ctx);
     }
 
     fn on_exit(&mut self) {

@@ -290,7 +290,7 @@ impl PxApp {
                 ui.strong(kind);
                 ui.label(format!("{}://{}:{}{}", h.scheme, h.host, h.port, h.target));
                 if editor.text != editor.original {
-                    ui.label(RichText::new("編集済み").color(Color32::from_rgb(240, 200, 80)));
+                    ui.label(RichText::new("編集済み").color(super::yellow(ui)));
                 }
             });
             if let Some(e) = &editor.error {

@@ -1,8 +1,9 @@
 //! 実際のアプリをウィンドウなしで動かし、記録済みの案件で各タブを描画できることを確かめる。
 
+use egui::Modifiers;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use px_store::{FlowSource, NewFlow, Project, SiteFilter, WsMessage};
+use px_store::{Filter, FlowSource, Highlight, NewFlow, Project, SiteFilter, WsMessage};
 
 use super::{PxApp, Tab};
 
@@ -62,6 +63,18 @@ fn recorded_project(dir: &std::path::Path) {
 
 fn has_label(h: &Harness<'_, PxApp>, text: &str) -> bool {
     h.query_all_by_label_contains(text).next().is_some()
+}
+
+/// 記録の書き込み（別スレッド）を待ちながら描画を進める。
+fn wait_until(h: &mut Harness<'_, PxApp>, done: impl Fn(&PxApp) -> bool) {
+    for _ in 0..200 {
+        h.run_steps(1);
+        if done(h.state()) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("条件が満たされません");
 }
 
 #[test]
@@ -142,6 +155,57 @@ fn every_tab_renders_recorded_traffic() {
     assert!(has_label(&h, "パスは / で始めてください"), "追加したパスは空");
     let saved = std::fs::read_to_string(h.state().project.as_ref().unwrap().settings_path()).unwrap();
     assert!(saved.contains("[[mock_servers]]"), "{saved}");
+
+    // History の詳細条件: 本文検索（JSON の中身）。詳細条件の行も描画できる
+    h.state_mut().tab = Tab::History;
+    h.state_mut().filter_form.expanded = true;
+    h.state_mut().filter.content.text = "ALICE".into();
+    h.run_steps(3);
+    assert_eq!(h.state().ids, [2], "大文字小文字を無視して Body を探す");
+    assert!(has_label(&h, "所要時間") && has_label(&h, "詳細条件 (1)"));
+    h.state_mut().filter.content.regex = true;
+    h.state_mut().filter.content.text = "(".into();
+    h.run_steps(2);
+    assert_eq!(h.state().ids, [2], "正規表現が誤っていれば前の条件のまま");
+    assert!(has_label(&h, "本文検索の正規表現"));
+    h.state_mut().filter = Filter::default();
+    h.run_steps(2);
+    assert_eq!(h.state().ids.len(), 5);
+
+    // 複数選択して色を付け、色で絞り込む
+    h.state_mut().click_row(1, Modifiers::NONE);
+    h.state_mut().click_row(2, Modifiers { shift: true, ..Modifiers::NONE });
+    assert_eq!(h.state().picked.iter().copied().collect::<Vec<_>>(), [1, 2]);
+    h.state_mut().set_color(vec![1, 2], Some(Highlight::Red));
+    h.state_mut().filter.colors = Highlight::Red.bit();
+    wait_until(&mut h, |a| a.ids == [1, 2]);
+
+    // 削除は確認してから。消えた行はサイトマップからも消える
+    h.state_mut().filter = Filter::default();
+    h.run_steps(2);
+    h.state_mut().request_delete(vec![1], "この通信".into());
+    h.run_steps(2);
+    assert!(has_label(&h, "元に戻せません"));
+    h.get_by_label("削除する").click();
+    h.run_steps(2);
+    assert!(h.state().confirm_delete.is_none());
+    assert_eq!(h.state().ids, [2, 3, 4, 5]);
+    wait_until(&mut h, |a| a.total == 4 && a.pending_deletes.is_empty());
+    h.state_mut().tab = Tab::SiteMap;
+    h.run_steps(3);
+    assert!(has_label(&h, "https://example.com  (1)"), "サイトマップを読み直す");
+
+    // 表示メニュー（テーマ・文字の大きさ）は ui.toml に保存する
+    h.state_mut().prefs.mono_font = 16.0;
+    h.state().prefs.apply(&h.ctx);
+    h.get_by_label("表示").click();
+    h.run_steps(2);
+    assert!(has_label(&h, "システムに合わせる"));
+    h.get_by_label("ライト").click();
+    h.run_steps(2);
+    assert_eq!(h.state().prefs.theme, super::prefs::ThemeChoice::Light);
+    let saved = std::fs::read_to_string(tmp.path().join("appdata").join("pxproxy").join("ui.toml")).unwrap();
+    assert!(saved.contains("theme = \"light\"") && saved.contains("mono_font = 16.0"), "{saved}");
 
     // 案件でも空でもないフォルダは開かない
     let other = tmp.path().join("other");

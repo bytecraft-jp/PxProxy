@@ -65,6 +65,17 @@ fn write_file(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Body を消す。ファイルに置いていたものはそのパスを返すので、コミットしてから消すこと
+/// （先に消すと、コミットに失敗したとき DB からは参照されたままファイルだけ無くなる）。
+pub fn remove(conn: &Connection, bodies_dir: &Path, hash: &[u8]) -> Result<Option<PathBuf>> {
+    let location: Option<i64> = conn
+        .prepare_cached("SELECT location FROM bodies WHERE hash = ?1")?
+        .query_row([hash], |r| r.get(0))
+        .optional()?;
+    conn.prepare_cached("DELETE FROM bodies WHERE hash = ?1")?.execute([hash])?;
+    Ok((location == Some(LOC_FILE)).then(|| file_path(bodies_dir, hash)))
+}
+
 pub fn get(conn: &Connection, bodies_dir: &Path, hash: Option<Vec<u8>>) -> Result<Vec<u8>> {
     let Some(hash) = hash else {
         return Ok(Vec::new());

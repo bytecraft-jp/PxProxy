@@ -3,7 +3,7 @@ use rusqlite::{Connection, params};
 use crate::Result;
 use crate::classify::{classify, content_type};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// 接続設定。journal_mode の変更は書き込み接続でのみ行う。
 pub fn tune(conn: &Connection, writable: bool) -> Result<()> {
@@ -70,6 +70,15 @@ pub fn migrate(conn: &Connection) -> Result<()> {
              CREATE INDEX IF NOT EXISTS findings_check ON findings(check_id, flow_id);
              CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID;
              PRAGMA user_version = 4;
+             COMMIT;",
+        )?;
+    }
+    if version < 5 {
+        // v5: 利用者が行に付ける色（Highlight）
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE flows ADD COLUMN color INTEGER;
+             PRAGMA user_version = 5;
              COMMIT;",
         )?;
     }

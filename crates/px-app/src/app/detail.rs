@@ -7,7 +7,7 @@ use egui::{Align, Color32, Key, KeyboardShortcut, Layout, Modifiers, RichText};
 use egui_extras::{Column, TableBuilder};
 use px_store::{Finding, FlowSummary, Reader, WsMessage};
 
-use super::{GREEN, PxApp, YELLOW, severity_color};
+use super::{GREEN, PxApp, severity_color, yellow};
 use crate::codec::{self, Output};
 use crate::highlight::{self, MAX_MATCHES, Theme};
 use crate::view::{self, Rendered};
@@ -177,7 +177,8 @@ impl Detail {
         };
         let p = self.painted[i].as_mut().expect("update_matches first");
         if p.job_key != key {
-            p.job = highlight::layout_job(text, r.body_start, r.syntax, &p.matches, current, theme);
+            let syntax = r.syntax_for(mode == ViewMode::Pretty);
+            p.job = highlight::layout_job(text, r.body_start, syntax, &p.matches, current, theme);
             p.job_key = key;
         }
         (&p.job, text, &p.matches)
@@ -361,7 +362,7 @@ impl PxApp {
                         if ui.selectable_label(!d.show_orig[i], "編集後").clicked() {
                             d.show_orig[i] = false;
                         }
-                        if ui.selectable_label(d.show_orig[i], RichText::new("編集前").color(YELLOW)).clicked() {
+                        if ui.selectable_label(d.show_orig[i], RichText::new("編集前").color(yellow(ui))).clicked() {
                             d.show_orig[i] = true;
                         }
                     }
@@ -618,18 +619,18 @@ fn info_bar(ui: &mut egui::Ui, d: &mut Detail) {
         ] {
             if s.truncated & bit != 0 {
                 ui.separator();
-                ui.label(RichText::new(format!("{side} の Body は先頭 {} のみ記録（全体 {}）", view::human_size(kept as i64), view::human_size(len))).color(YELLOW))
+                ui.label(RichText::new(format!("{side} の Body は先頭 {} のみ記録（全体 {}）", view::human_size(kept as i64), view::human_size(len))).color(yellow(ui)))
                     .on_hover_text("「診断対象 / ルール」の「記録する Body の上限」を超えたため、通信はそのまま流し、先頭だけを記録しました");
             }
         }
         if let Some(worst) = d.findings.first().map(|f| f.severity) {
             ui.separator();
-            let label = RichText::new(format!("⚠ 検出 {} 件", d.findings.len())).color(severity_color(worst));
+            let label = RichText::new(format!("⚠ 検出 {} 件", d.findings.len())).color(severity_color(ui, worst));
             ui.label(label).on_hover_ui(|ui| {
                 for f in &d.findings {
                     let title = px_store::passive::check(&f.check).map_or(f.check.as_str(), |c| c.title);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("[{}]", f.severity.label())).color(severity_color(f.severity)));
+                        ui.label(RichText::new(format!("[{}]", f.severity.label())).color(severity_color(ui, f.severity)));
                         ui.label(format!("{title}: {}", f.detail));
                     });
                 }
@@ -780,7 +781,7 @@ fn ws_pane(ui: &mut egui::Ui, ws: &mut WsView, selection: &mut Option<Selection>
             ui.strong(if m.from_client { "↑ クライアント → サーバ" } else { "↓ サーバ → クライアント" });
             ui.label(format!("{}  {} bytes  {}", m.opcode_label(), m.len, view::format_datetime(m.at_us)));
             if m.len > m.data.len() as u64 {
-                ui.label(RichText::new(format!("（先頭 {} のみ記録）", view::human_size(m.data.len() as i64))).color(YELLOW));
+                ui.label(RichText::new(format!("（先頭 {} のみ記録）", view::human_size(m.data.len() as i64))).color(yellow(ui)));
             }
             if ui.small_button("コピー").clicked() {
                 ui.ctx().copy_text(text.clone());

@@ -441,7 +441,8 @@ impl PxApp {
                 }
                 if r.job.as_ref().is_none_or(|(m, t, _)| *m != mode || *t != theme) {
                     let text = shown_text(&r.rendered, mode);
-                    let job = highlight::layout_job(text, r.rendered.body_start, r.rendered.syntax, &[], None, &theme);
+                    let syntax = r.rendered.syntax_for(mode == ViewMode::Pretty);
+                    let job = highlight::layout_job(text, r.rendered.body_start, syntax, &[], None, &theme);
                     r.job = Some((mode, theme.clone(), job));
                 }
                 let job = &r.job.as_ref().expect("built above").2;

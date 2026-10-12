@@ -63,6 +63,47 @@ pub const TRUNCATED_RESPONSE: u8 = 2;
 pub const EDITED_REQUEST: u8 = 1;
 pub const EDITED_RESPONSE: u8 = 2;
 
+/// 利用者が行に付ける色。値は DB に保存するので変更しないこと。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Highlight {
+    Red = 1,
+    Orange = 2,
+    Yellow = 3,
+    Green = 4,
+    Cyan = 5,
+    Blue = 6,
+    Purple = 7,
+    Gray = 8,
+}
+
+impl Highlight {
+    pub const ALL: [Highlight; 8] =
+        [Self::Red, Self::Orange, Self::Yellow, Self::Green, Self::Cyan, Self::Blue, Self::Purple, Self::Gray];
+
+    pub fn from_i64(v: i64) -> Option<Self> {
+        Self::ALL.into_iter().find(|h| *h as i64 == v)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Red => "赤",
+            Self::Orange => "橙",
+            Self::Yellow => "黄",
+            Self::Green => "緑",
+            Self::Cyan => "水色",
+            Self::Blue => "青",
+            Self::Purple => "紫",
+            Self::Gray => "灰",
+        }
+    }
+
+    /// `Filter::colors` のビット（0 ビット目は `NO_COLOR`）
+    pub fn bit(self) -> u32 {
+        1 << self as u8
+    }
+}
+
 /// 一覧表示用の軽量な行。
 #[derive(Debug, Clone)]
 pub struct FlowSummary {
@@ -89,6 +130,8 @@ pub struct FlowSummary {
     pub truncated: u8,
     /// パッシブチェックの検出のうち最も重いもの
     pub max_severity: Option<Severity>,
+    /// 利用者が付けた色
+    pub color: Option<Highlight>,
 }
 
 #[derive(Debug, Clone)]

@@ -1,11 +1,13 @@
 //! メッセージ表示用の整形（Content-Encoding の展開、画像プレビュー、バイナリの hexdump、巨大 Body の切り詰め、
-//! JSON / HTML / XML の整形）。
+//! JSON / HTML / XML / GraphQL の整形、Protobuf のデコード）。
 
 use std::fmt::Write;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use px_store::decode_content;
 use time::{OffsetDateTime, UtcOffset};
+
+use crate::{graphql, protobuf};
 
 const MAX_TEXT: usize = 512 * 1024;
 const MAX_HEX: usize = 64 * 1024;
@@ -30,6 +32,10 @@ pub enum Syntax {
     Json,
     Html,
     Xml,
+    /// GraphQL のクエリ
+    Graphql,
+    /// Protobuf をデコードした表示（整形表示のみ）
+    Protobuf,
 }
 
 /// 整形済みメッセージ。`text` は Raw 表示（ヘッダ + 本文テキスト or hexdump）。
@@ -42,13 +48,28 @@ pub struct Rendered {
     pub syntax: Syntax,
     /// 整形表示（ヘッダ + 整形した Body）。整形できない・変化しないなら None
     pub pretty: Option<String>,
+    /// 整形表示のハイライト種別（GraphQL のリクエスト・Protobuf は Raw と異なる）
+    pub pretty_syntax: Syntax,
     pub image: Option<ImagePreview>,
 }
 
 impl Rendered {
     /// ヘッダも Body も無い、メッセージだけの表示（接続エラー等）。
     pub fn plain(text: String) -> Self {
-        Self { head: String::new(), text, body_start: 0, syntax: Syntax::Plain, pretty: None, image: None }
+        Self {
+            head: String::new(),
+            text,
+            body_start: 0,
+            syntax: Syntax::Plain,
+            pretty: None,
+            pretty_syntax: Syntax::Plain,
+            image: None,
+        }
+    }
+
+    /// 表示中のテキスト（整形表示か Raw か）のハイライト種別。
+    pub fn syntax_for(&self, pretty: bool) -> Syntax {
+        if pretty && self.pretty.is_some() { self.pretty_syntax } else { self.syntax }
     }
 }
 
@@ -58,7 +79,7 @@ pub fn render_message(head: &[u8], body: &[u8], uri_key: &str) -> Rendered {
     let mut text = head_text.clone();
     if body.is_empty() {
         let body_start = text.len();
-        return Rendered { head: head_text, text, body_start, syntax: Syntax::Plain, pretty: None, image: None };
+        return Rendered { head: head_text, body_start, ..Rendered::plain(text) };
     }
 
     let encoding = header_value(&head_text, "content-encoding").unwrap_or_default().to_ascii_lowercase();
@@ -79,13 +100,18 @@ pub fn render_message(head: &[u8], body: &[u8], uri_key: &str) -> Rendered {
         .unwrap_or_default();
     let image = image_preview(&content_type, &body, uri_key);
     let body_start = text.len();
+    let protobuf = protobuf::is_protobuf(&content_type);
 
-    if image.as_ref().is_some_and(|i| i.mime != "image/svg+xml") || !looks_like_text(&body) {
+    if image.as_ref().is_some_and(|i| i.mime != "image/svg+xml") || protobuf || !looks_like_text(&body) {
         hexdump(&mut text, &body[..body.len().min(MAX_HEX)]);
         if body.len() > MAX_HEX {
             let _ = write!(text, "[... {} bytes 省略 ...]", body.len() - MAX_HEX);
         }
-        return Rendered { head: head_text, text, body_start, syntax: Syntax::Plain, pretty: None, image };
+        let pretty = protobuf
+            .then(|| protobuf::decode_body(&head_text, &content_type, &body[..body.len().min(MAX_PRETTY_INPUT)]))
+            .flatten()
+            .map(|p| with_head(&text[..body_start], &p));
+        return Rendered { head: head_text, body_start, pretty, pretty_syntax: Syntax::Protobuf, image, ..Rendered::plain(text) };
     }
 
     text.push_str(&String::from_utf8_lossy(&body[..body.len().min(MAX_TEXT)]));
@@ -93,25 +119,33 @@ pub fn render_message(head: &[u8], body: &[u8], uri_key: &str) -> Rendered {
         let _ = write!(text, "\n\n[... {} bytes 省略 ...]", body.len() - MAX_TEXT);
     }
     let syntax = detect_syntax(&content_type, &body);
-    let pretty = (body.len() <= MAX_PRETTY_INPUT)
-        .then(|| std::str::from_utf8(&body).ok())
-        .flatten()
-        .and_then(|b| prettify(syntax, b).filter(|p| p != b))
-        .map(|p| {
-            let mut out = text[..body_start].to_string();
-            out.push_str(truncate_str(&p, MAX_PRETTY));
-            if p.len() > MAX_PRETTY {
-                let _ = write!(out, "\n\n[... 整形結果の残り {} bytes 省略 ...]", p.len() - MAX_PRETTY);
-            }
-            out
-        });
-    Rendered { head: head_text, text, body_start, syntax, pretty, image }
+    let utf8 = (body.len() <= MAX_PRETTY_INPUT).then(|| std::str::from_utf8(&body).ok()).flatten();
+    // GraphQL のリクエストはクエリと variables を取り出して整形する。それ以外は種類ごとの整形
+    let (pretty, pretty_syntax) = match utf8.and_then(|b| graphql::pretty_request(&content_type, b)) {
+        Some(g) => (Some(g), Syntax::Graphql),
+        None => (utf8.and_then(|b| prettify(syntax, b).filter(|p| p != b)), syntax),
+    };
+    let pretty = pretty.map(|p| with_head(&text[..body_start], &p));
+    Rendered { head: head_text, text, body_start, syntax, pretty, pretty_syntax, image }
+}
+
+/// ヘッダ（と注記）の後に整形した Body を付ける。長すぎる分は省略する。
+fn with_head(head: &str, pretty: &str) -> String {
+    let mut out = head.to_string();
+    out.push_str(truncate_str(pretty, MAX_PRETTY));
+    if pretty.len() > MAX_PRETTY {
+        let _ = write!(out, "\n\n[... 整形結果の残り {} bytes 省略 ...]", pretty.len() - MAX_PRETTY);
+    }
+    out
 }
 
 /// Content-Type（無ければ先頭バイト）から Body の種類を決める。
 fn detect_syntax(content_type: &str, body: &[u8]) -> Syntax {
     if content_type.contains("json") {
         return Syntax::Json;
+    }
+    if content_type.contains("graphql") {
+        return Syntax::Graphql;
     }
     if content_type.contains("html") {
         return Syntax::Html;
@@ -137,7 +171,8 @@ fn prettify(syntax: Syntax, body: &str) -> Option<String> {
         Syntax::Json => pretty_json(body),
         Syntax::Html => pretty_markup(body, true),
         Syntax::Xml => pretty_markup(body, false),
-        Syntax::Plain => None,
+        Syntax::Graphql => graphql::pretty_query(body),
+        Syntax::Plain | Syntax::Protobuf => None,
     }
 }
 
@@ -609,6 +644,30 @@ mod tests {
         assert_eq!((r.syntax, r.pretty.is_some()), (Syntax::Xml, true));
         // 既に整形済みなら整形表示は出さない
         let r = render_message(b"HTTP/1.1 200 OK\r\n\r\n", b"[]", "t");
+        assert!(r.pretty.is_none());
+    }
+
+    #[test]
+    fn graphql_request_is_shown_as_query() {
+        let body = br#"{"query":"{ me { id } }","variables":{"a":1}}"#;
+        let r = render_message(b"POST /graphql HTTP/1.1\r\nContent-Type: application/json\r\n\r\n", body, "t");
+        assert_eq!((r.syntax, r.pretty_syntax), (Syntax::Json, Syntax::Graphql));
+        assert_eq!(&r.pretty.as_ref().unwrap()[r.body_start..], "{\n  me {\n    id\n  }\n}\n\n# variables\n{\n  \"a\": 1\n}");
+        assert_eq!((r.syntax_for(true), r.syntax_for(false)), (Syntax::Graphql, Syntax::Json));
+        // 普通の JSON はこれまでどおり
+        let r = render_message(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n", br#"{"data":{"me":1}}"#, "t");
+        assert_eq!(r.pretty_syntax, Syntax::Json);
+    }
+
+    #[test]
+    fn protobuf_is_decoded_in_pretty_view() {
+        let body = [0x08, 0x96, 0x01, 0x12, 0x02, b'h', b'i'];
+        let r = render_message(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\n\r\n", &body, "t");
+        assert!(r.text.contains("00000000  08 96 01 12"), "Raw は hexdump: {}", r.text);
+        assert_eq!(&r.pretty.as_ref().unwrap()[r.body_start..], "1: 150\n2: \"hi\"\n");
+        assert_eq!(r.syntax_for(true), Syntax::Protobuf);
+        // デコードできなければ整形表示は出さない
+        let r = render_message(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\n\r\n", &[0x08], "t");
         assert!(r.pretty.is_none());
     }
 

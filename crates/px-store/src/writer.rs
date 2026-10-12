@@ -5,6 +5,7 @@
 //! 調べ残し（v4 より前に記録したもの・再スキャン）は空いた時間に少しずつ調べる。
 //! どこまで調べたかは meta.passive_upto に残すので、途中で閉じても次に開いたとき続きから進む。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -12,10 +13,12 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use parking_lot::Mutex;
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::classify::{classify, content_type};
-use crate::model::{EDITED_REQUEST, EDITED_RESPONSE, NewFlow, TRUNCATED_REQUEST, TRUNCATED_RESPONSE, WsMessage};
+use crate::model::{
+    EDITED_REQUEST, EDITED_RESPONSE, Highlight, NewFlow, TRUNCATED_REQUEST, TRUNCATED_RESPONSE, WsMessage,
+};
 use crate::passive::{self, Exchange};
 use crate::{FlowSource, Result, body, schema};
 
@@ -34,6 +37,10 @@ enum Op {
     Ws(Box<WsMessage>),
     /// メモの更新（None で削除）
     SetNote { id: i64, note: Option<String> },
+    /// 色の更新（None で外す）
+    SetColor { ids: Vec<i64>, color: Option<Highlight> },
+    /// フローを消す（WebSocket のメッセージ・検出・参照されなくなった Body も）
+    Delete(Vec<i64>),
     /// パッシブチェックの結果を消して最初から調べ直す
     Rescan,
 }
@@ -70,6 +77,20 @@ impl FlowSink {
         let note = (!note.trim().is_empty()).then(|| note.to_owned());
         if self.tx.send(Op::SetNote { id, note }).is_err() {
             tracing::warn!("note dropped: writer closed");
+        }
+    }
+
+    /// フローに色を付ける（None で外す）。ノンブロッキング。
+    pub fn set_color(&self, ids: Vec<i64>, color: Option<Highlight>) {
+        if self.tx.send(Op::SetColor { ids, color }).is_err() {
+            tracing::warn!("color dropped: writer closed");
+        }
+    }
+
+    /// フローを消す。元に戻せない。ノンブロッキングで、記録と同じ順に書き込む。
+    pub fn delete(&self, ids: Vec<i64>) {
+        if self.tx.send(Op::Delete(ids)).is_err() {
+            tracing::warn!("delete dropped: writer closed");
         }
     }
 
@@ -200,6 +221,8 @@ impl State {
 
     fn write_batch(&mut self, batch: &[Op]) -> Result<()> {
         let tx = self.conn.transaction()?;
+        // 消したフローが参照していた Body（他から参照されていなければ最後に消す）
+        let mut orphans: HashSet<Vec<u8>> = HashSet::new();
         for op in batch {
             match op {
                 Op::Insert(id, f) => {
@@ -220,14 +243,31 @@ impl State {
                 Op::SetNote { id, note } => {
                     tx.prepare_cached("UPDATE flows SET note = ?2 WHERE id = ?1")?.execute(params![id, note])?;
                 }
+                Op::SetColor { ids, color } => {
+                    let mut st = tx.prepare_cached("UPDATE flows SET color = ?2 WHERE id = ?1")?;
+                    for id in ids {
+                        st.execute(params![id, color.map(|c| c as u8)])?;
+                    }
+                }
+                Op::Delete(ids) => {
+                    for id in ids {
+                        orphans.extend(delete_flow(&tx, *id)?);
+                    }
+                }
                 Op::Rescan => {
                     tx.execute("DELETE FROM findings", [])?;
                     self.upto = 0;
                 }
             }
         }
+        let files = if orphans.is_empty() { Vec::new() } else { remove_orphans(&tx, &self.bodies_dir, orphans)? };
         schema::meta_set(&tx, PASSIVE_UPTO, self.upto)?;
         tx.commit()?;
+        for f in files {
+            if let Err(e) = std::fs::remove_file(&f) {
+                tracing::warn!("failed to remove {}: {e}", f.display());
+            }
+        }
         Ok(())
     }
 
@@ -331,6 +371,44 @@ fn insert_flow(tx: &Transaction<'_>, bodies_dir: &Path, id: i64, f: &NewFlow) ->
         truncated,
     ])?;
     Ok(())
+}
+
+/// フローと、それに付いた WebSocket のメッセージ・検出を消す。参照していた Body のハッシュを返す。
+fn delete_flow(tx: &Transaction<'_>, id: i64) -> Result<Vec<Vec<u8>>> {
+    type Blob = Option<Vec<u8>>;
+    let hashes: Option<[Blob; 4]> = tx
+        .prepare_cached("SELECT req_body, res_body, orig_req_body, orig_res_body FROM flows WHERE id = ?1")?
+        .query_row([id], |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?]))
+        .optional()?;
+    let Some(hashes) = hashes else { return Ok(Vec::new()) };
+    tx.prepare_cached("DELETE FROM flows WHERE id = ?1")?.execute([id])?;
+    tx.prepare_cached("DELETE FROM ws_messages WHERE flow_id = ?1")?.execute([id])?;
+    tx.prepare_cached("DELETE FROM findings WHERE flow_id = ?1")?.execute([id])?;
+    Ok(hashes.into_iter().flatten().collect())
+}
+
+/// `candidates` のうち、どのフローからも参照されなくなった Body を消す。消すべきファイルのパスを返す。
+/// Body の列には索引が無いので、候補ごとに探さず、参照中のハッシュを 1 回の走査で集める。
+fn remove_orphans(tx: &Transaction<'_>, bodies_dir: &Path, candidates: HashSet<Vec<u8>>) -> Result<Vec<PathBuf>> {
+    let mut used: HashSet<Vec<u8>> = HashSet::new();
+    {
+        let mut st = tx.prepare("SELECT req_body, res_body, orig_req_body, orig_res_body FROM flows")?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            for i in 0..4 {
+                if let Some(h) = r.get::<_, Option<Vec<u8>>>(i)?
+                    && candidates.contains(&h)
+                {
+                    used.insert(h);
+                }
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for hash in candidates.difference(&used) {
+        files.extend(body::remove(tx, bodies_dir, hash)?);
+    }
+    Ok(files)
 }
 
 fn insert_findings(tx: &Transaction<'_>, id: i64, f: &NewFlow) -> Result<()> {

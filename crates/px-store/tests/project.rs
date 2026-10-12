@@ -226,6 +226,163 @@ fn site_filter_matches_path_prefix() {
 }
 
 #[test]
+fn advanced_filters_and_content_search() {
+    use px_store::{ALL_METHODS, ContentQuery, MethodClass, SearchIn};
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = Project::create(tmp.path().join("f.pxproj"), None).unwrap();
+    let sink = project.sink();
+    // 1: GET、gzip の Body に「秘密のトークン」
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all("{\"msg\":\"秘密のトークン\"}".as_bytes()).unwrap();
+    let mut f = flow("api.example.com", gz.finish().unwrap());
+    f.res_head = Some(b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n".to_vec());
+    f.target = "/v1/users".into();
+    sink.submit(f);
+    // 2: POST、Request の Body に password、大きい Response（ファイルに置かれる）、遅い
+    let mut f = flow("www.example.com", vec![b'x'; INLINE_THRESHOLD * 2]);
+    f.method = "POST".into();
+    f.req_body = b"user=a&password=Hunter2".to_vec();
+    f.duration_us = 1_500_000;
+    sink.submit(f);
+    // 3: CONNECT（その他のメソッド）
+    let mut f = flow("www.example.com", Vec::new());
+    f.method = "CONNECT".into();
+    sink.submit(f);
+    sink.set_note(3, "メモ");
+    drop(sink);
+    let reader = project.reader().unwrap();
+    wait_for(&reader, 3);
+
+    let ids = |f: Filter| reader.ids_after(0, &f).unwrap();
+    let methods = |m: &[MethodClass]| m.iter().fold(0, |acc, m| acc | m.bit());
+    assert_eq!(ids(Filter { methods: methods(&[MethodClass::Post]), ..Default::default() }), [2]);
+    assert_eq!(ids(Filter { methods: methods(&[MethodClass::Get, MethodClass::Other]), ..Default::default() }), [1, 3]);
+    assert_eq!(ids(Filter { methods: ALL_METHODS & !MethodClass::Other.bit(), ..Default::default() }), [1, 2]);
+    assert_eq!(ids(Filter { noted_only: true, ..Default::default() }), [3]);
+    assert_eq!(ids(Filter { length: (Some(1), Some(100)), ..Default::default() }), [1]);
+    assert_eq!(ids(Filter { length: (Some(INLINE_THRESHOLD as u64), None), ..Default::default() }), [2]);
+    assert_eq!(ids(Filter { duration_ms: (Some(1000), None), ..Default::default() }), [2]);
+    assert_eq!(ids(Filter { duration_ms: (None, Some(0)), ..Default::default() }), [1, 3], "2 µs は 0 ms");
+    assert_eq!(ids(Filter { text: r"^/v\d+/".into(), text_regex: true, ..Default::default() }), [1]);
+    assert_eq!(ids(Filter { text: r"^API\.".into(), text_regex: true, ..Default::default() }), [1], "大文字小文字無視");
+
+    let content = |text: &str, regex: bool, case_sensitive: bool, target: SearchIn| Filter {
+        content: ContentQuery { text: text.into(), regex, case_sensitive, target },
+        ..Default::default()
+    };
+    assert_eq!(ids(content("秘密のトークン", false, false, SearchIn::Both)), [1], "gzip を展開して探す");
+    assert_eq!(ids(content("HUNTER2", false, false, SearchIn::Both)), [2]);
+    assert!(ids(content("HUNTER2", false, true, SearchIn::Both)).is_empty(), "大文字小文字を区別");
+    assert!(ids(content("Hunter2", false, false, SearchIn::Response)).is_empty(), "Response だけ");
+    assert_eq!(ids(content("x{1000}", true, false, SearchIn::Response)), [2], "ファイルに置いた Body も");
+    assert_eq!(ids(content("content-encoding: gzip", false, false, SearchIn::Response)), [1], "ヘッダも");
+    assert_eq!(ids(content("a.b", false, false, SearchIn::Both)), Vec::<i64>::new(), "正規表現でなければ . はそのまま");
+
+    let bad = content("(", true, false, SearchIn::Both);
+    assert!(bad.error().is_some());
+    assert!(reader.ids_after(0, &bad).is_err());
+
+    // 期限を過ぎていても 1 件は進み、続きから調べられる
+    let all = content("e", false, false, SearchIn::Both);
+    let past = Some(std::time::Instant::now());
+    let first = reader.scan_after(0, &all, past).unwrap();
+    assert_eq!((first.upto, first.complete), (1, false));
+    let rest = reader.scan_after(first.upto, &all, None).unwrap();
+    assert_eq!((rest.upto, rest.complete), (3, true));
+}
+
+#[test]
+fn colors_and_delete() {
+    use px_store::{ALL_COLORS, Highlight, NO_COLOR};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("d.pxproj");
+    let project = Project::create(&dir, None).unwrap();
+    let sink = project.sink();
+    let large: Vec<u8> = (0..INLINE_THRESHOLD * 2).map(|i| (i % 13) as u8).collect();
+    let shared: Vec<u8> = (0..INLINE_THRESHOLD * 2).map(|i| (i % 17) as u8).collect();
+    sink.submit(flow("a.test", large)); // 1: このフローだけが参照する大きい Body
+    sink.submit(flow("a.test", shared.clone())); // 2, 3: 同じ Body を共有
+    sink.submit(flow("a.test", shared.clone()));
+    let mut ws = flow("a.test", Vec::new());
+    ws.status = Some(101);
+    let ws_id = sink.submit(ws);
+    sink.submit_ws(px_store::WsMessage {
+        id: 0,
+        flow_id: ws_id,
+        at_us: 0,
+        from_client: true,
+        opcode: px_store::WsMessage::TEXT,
+        len: 2,
+        data: b"hi".to_vec(),
+    });
+    sink.set_color(vec![1, 2], Some(Highlight::Red));
+    sink.set_color(vec![2], Some(Highlight::Blue));
+    sink.set_color(vec![4], Some(Highlight::Green));
+    sink.set_color(vec![4], None);
+    let reader = project.reader().unwrap();
+    wait_for(&reader, 4);
+    let files = |dir: &std::path::Path| {
+        let mut n = 0;
+        let mut stack = vec![dir.join("bodies")];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(d).unwrap() {
+                let e = e.unwrap();
+                if e.file_type().unwrap().is_dir() {
+                    stack.push(e.path());
+                } else {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    for _ in 0..100 {
+        if reader.summary(4).unwrap().unwrap().color.is_none() && reader.summary(2).unwrap().unwrap().color.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(reader.summary(1).unwrap().unwrap().color, Some(Highlight::Red));
+    assert_eq!(reader.summary(2).unwrap().unwrap().color, Some(Highlight::Blue));
+    assert_eq!(reader.summary(4).unwrap().unwrap().color, None);
+    let colored = |colors| reader.ids_after(0, &Filter { colors, ..Default::default() }).unwrap();
+    assert_eq!(colored(Highlight::Red.bit() | Highlight::Blue.bit()), [1, 2]);
+    assert_eq!(colored(NO_COLOR), [3, 4]);
+    assert!(colored(0).is_empty());
+    assert_eq!(colored(ALL_COLORS).len(), 4);
+    assert_eq!(files(&dir), 2);
+
+    // 1 と 2 と 4 を消す。共有している Body は 3 が使うので残る
+    sink.delete(vec![1, 2, 4]);
+    drop(sink);
+    project.close();
+    let project = Project::open(&dir, None).unwrap();
+    let reader = project.reader().unwrap();
+    assert_eq!(reader.ids_after(0, &Filter::default()).unwrap(), [3]);
+    assert!(reader.ws_messages(ws_id, 0).unwrap().is_empty(), "WebSocket のメッセージも消える");
+    assert_eq!(files(&dir), 1, "参照されなくなった Body のファイルだけ消える");
+    assert_eq!(reader.detail(3).unwrap().unwrap().res_body, shared);
+}
+
+#[test]
+fn out_of_scope_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = Project::create(tmp.path().join("o.pxproj"), None).unwrap();
+    let sink = project.sink();
+    for host in ["a.test", "b.test", "a.test"] {
+        sink.submit(flow(host, Vec::new()));
+    }
+    let reader = project.reader().unwrap();
+    wait_for(&reader, 3);
+    assert!(reader.ids_out_of_scope().unwrap().is_empty(), "既定はすべて診断対象");
+    reader.set_scope(|host, _| host == "a.test").unwrap();
+    assert_eq!(reader.ids_out_of_scope().unwrap(), [2]);
+}
+
+#[test]
 fn passive_findings_are_recorded_and_rescanned() {
     let tmp = tempfile::tempdir().unwrap();
     let project = Project::create(tmp.path().join("p.pxproj"), None).unwrap();

@@ -2,6 +2,7 @@
 //! エラーメッセージの露出など）を印付けする。通信は送らない。
 //! writer スレッドで実行するので、プロキシの転送は待たせない。
 
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::sync::LazyLock;
 
@@ -60,6 +61,10 @@ macro_rules! checks {
 }
 
 checks! {
+    JWT_WEAK_SECRET = ("jwt-weak-secret", High, "JWT が推測しやすい秘密鍵で署名されている",
+        "HMAC（HS256 など）で署名された JWT の秘密鍵が、よく使われる文字列（secret など）でした。誰でも任意の内容の JWT を作れます。");
+    JWT_NONE = ("jwt-alg-none", Medium, "JWT の署名アルゴリズムが none",
+        "ヘッダの alg が none の JWT です。サーバが受け付けると、署名なしで内容を書き換えられます。");
     SQL_ERROR = ("sql-error", Medium, "SQL のエラーメッセージ",
         "レスポンスにデータベースのエラーメッセージが含まれています。SQL インジェクションの手掛かりになります。");
     PASSWORD_OVER_HTTP = ("password-over-http", Medium, "パスワードを平文 HTTP で送受信",
@@ -82,6 +87,16 @@ checks! {
         "パスワードやトークンらしきパラメータが URL のクエリに含まれています。ログや Referer に残ります。");
     DIRECTORY_LISTING = ("directory-listing", Low, "ディレクトリ一覧",
         "Web サーバのディレクトリ一覧が表示されています。");
+    MIXED_CONTENT = ("mixed-content", Low, "HTTPS のページから HTTP で読み込み（混在コンテンツ）",
+        "HTTPS の HTML が script / iframe / link / form などで平文 HTTP の URL を参照しています。改ざん・盗聴の入口になります。");
+    CACHEABLE_SENSITIVE = ("cache-sensitive", Low, "機密らしい応答のキャッシュを禁止していない",
+        "Set-Cookie を含む、または Authorization 付きのリクエストへの応答に Cache-Control: no-store / private / no-cache がありません。共有キャッシュやブラウザに残るおそれがあります。");
+    JWT_NO_EXP = ("jwt-no-exp", Info, "JWT に有効期限（exp）がない",
+        "ペイロードに exp クレームの無い JWT です。漏れたトークンをいつまでも使えるおそれがあります。");
+    SOURCE_MAP = ("source-map", Info, "ソースマップの公開",
+        "JavaScript / CSS がソースマップを参照しているか、ソースマップ自体が取得できます。元のソースコードやコメントが読めます。");
+    HTML_COMMENT = ("html-comment", Info, "HTML コメントに気になる記述",
+        "HTML コメントにパスワード・トークン・TODO・デバッグなどの語が含まれています。開発時のメモや内部情報が残っていないか確認してください。");
     COOKIE_NO_SAMESITE = ("cookie-no-samesite", Info, "Cookie に SameSite 属性がない",
         "SameSite 属性のない Cookie です（ブラウザの既定は Lax）。");
     CSP_MISSING = ("csp-missing", Info, "Content-Security-Policy がない",
@@ -160,6 +175,37 @@ static LISTING_RE: LazyLock<Regex> = LazyLock::new(|| {
 static PASSWORD_INPUT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)<input[^>]+type\s*=\s*["']?password"#).expect("valid regex"));
 
+/// JWT（ヘッダは必ず `{"` = `eyJ` で始まる）
+static JWT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\beyJ[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*").expect("valid regex"));
+
+static SOURCE_MAP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[#@]\s*sourceMappingURL\s*=\s*(\S+)").expect("valid regex"));
+
+static HTML_COMMENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--(.*?)-->").expect("valid regex"));
+
+/// HTML コメントで気にする語
+static COMMENT_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)(password|passwd|secret|token|api[_-]?key|credential|todo|fixme|hack|debug|internal",
+        r"|パスワード|秘密|暫定|仮実装|要修正|デバッグ|本番|検証用|テスト用)"
+    ))
+    .expect("valid regex")
+});
+
+static MIXED_CONTENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<(?:script|iframe|frame|link|form|object|embed)\b[^>]*?\b(?:src|href|action|data)\s*=\s*["']?(http://[^"'\s>]+)"#)
+        .expect("valid regex")
+});
+
+/// よく使われる（推測しやすい）HMAC の秘密鍵。チュートリアルやライブラリの既定値など
+const WEAK_JWT_SECRETS: &[&str] = &[
+    "secret", "secretkey", "secret_key", "secret-key", "mysecret", "my_secret", "supersecret", "jwt", "jwtsecret",
+    "jwt_secret", "jwt-secret", "your-256-bit-secret", "your-384-bit-secret", "your-512-bit-secret", "your_jwt_secret",
+    "your-secret-key", "changeme", "change_me", "changethis", "password", "passw0rd", "123456", "1234567890", "qwerty",
+    "admin", "test", "key", "default", "s3cr3t", "secret123", "token", "",
+];
+
 /// クエリ・フォームのパラメータ名で機密らしいもの
 const SENSITIVE_PARAMS: &[&str] = &[
     "password", "passwd", "pwd", "pass", "passphrase", "secret", "client_secret", "token", "access_token",
@@ -178,8 +224,15 @@ pub fn scan(x: &Exchange<'_>) -> Vec<Hit> {
     };
     let https = x.scheme.eq_ignore_ascii_case("https");
     let req = String::from_utf8_lossy(x.req_head);
+    // 同じ JWT があちこちに出ても 1 回だけ調べる
+    let mut jwts = HashSet::new();
 
     // ---- リクエスト
+    check_jwts(&req, "リクエスト", &mut jwts, &mut hit);
+    if !x.req_body.is_empty() {
+        let body = String::from_utf8_lossy(&x.req_body[..x.req_body.len().min(64 * 1024)]);
+        check_jwts(&body, "リクエストの Body", &mut jwts, &mut hit);
+    }
     if let Some(query) = x.target.split_once('?').map(|(_, q)| q.split('#').next().unwrap_or("")) {
         for name in param_names(query) {
             if is_sensitive_param(&name) {
@@ -206,6 +259,30 @@ pub fn scan(x: &Exchange<'_>) -> Vec<Hit> {
     let status: u16 = res.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     let ct = content_type(Some(res_head)).unwrap_or_default();
     let html = ct == "text/html" || ct == "application/xhtml+xml";
+    let path = path_of(x.target);
+    check_jwts(&res, "レスポンスヘッダ", &mut jwts, &mut hit);
+
+    for name in ["sourcemap", "x-sourcemap"] {
+        if let Some(v) = header(&res, name) {
+            hit(SOURCE_MAP, format!("{name}: {v}"));
+        }
+    }
+
+    if (200..300).contains(&status) && (html || ct.contains("json") || ct.contains("xml") || ct == "text/plain") {
+        let cache_control = headers(&res, "cache-control").collect::<Vec<_>>().join(",").to_ascii_lowercase();
+        let forbidden = ["no-store", "private", "no-cache"].iter().any(|d| cache_control.contains(d))
+            || header(&res, "pragma").is_some_and(|v| v.to_ascii_lowercase().contains("no-cache"));
+        let reason = if headers(&res, "set-cookie").next().is_some() {
+            Some("Set-Cookie あり")
+        } else if header(&req, "authorization").is_some() {
+            Some("Authorization 付きのリクエスト")
+        } else {
+            None
+        };
+        if let Some(reason) = reason.filter(|_| !forbidden) {
+            hit(CACHEABLE_SENSITIVE, format!("{path}（{reason}）"));
+        }
+    }
 
     for (name, value) in ["server", "x-powered-by", "x-aspnet-version", "x-aspnetmvc-version", "x-generator"]
         .iter()
@@ -273,8 +350,9 @@ pub fn scan(x: &Exchange<'_>) -> Vec<Hit> {
         hit(NOSNIFF_MISSING, if ct.is_empty() { "Content-Type なし".into() } else { ct.clone() });
     }
 
-    // ---- Body（テキストだけ）
-    if x.res_body.is_empty() || !is_text_type(&ct) {
+    // ---- Body（テキストだけ。ソースマップ本体は application/octet-stream で返ることもある）
+    let source_map_file = ok && path.ends_with(".map");
+    if x.res_body.is_empty() || !(is_text_type(&ct) || source_map_file) {
         return hits;
     }
     let encoding = header(&res, "content-encoding").unwrap_or_default().to_ascii_lowercase();
@@ -297,6 +375,47 @@ pub fn scan(x: &Exchange<'_>) -> Vec<Hit> {
     if html && !https && PASSWORD_INPUT_RE.is_match(&body) {
         hit(PASSWORD_OVER_HTTP, format!("{} のパスワード入力欄", path_of(x.target)));
     }
+    check_jwts(&body, "レスポンスの Body", &mut jwts, &mut hit);
+    if source_map_file && body.contains("\"mappings\"") && body.contains("\"sources\"") {
+        hit(SOURCE_MAP, format!("{path}（ソースマップ本体）"));
+    } else if ct.contains("javascript") || ct == "text/css" || path.ends_with(".js") || path.ends_with(".css") {
+        // ソースマップの参照は末尾にあるので後ろから探す
+        let tail = &body[floor_char_boundary(&body, body.len().saturating_sub(64 * 1024))..];
+        if let Some(c) = SOURCE_MAP_RE.captures_iter(tail).last() {
+            let url = &c[1];
+            hit(SOURCE_MAP, if url.starts_with("data:") { "埋め込み（data: URI）".into() } else { url.to_string() });
+        }
+    }
+    if html {
+        let mut found = 0;
+        for c in HTML_COMMENT_RE.captures_iter(&body).take(500) {
+            let comment = c[1].trim();
+            // 条件付きコメント（<!--[if IE]>）は対象外
+            if comment.starts_with("[if") || comment.starts_with("<![endif") || !COMMENT_KEYWORD_RE.is_match(comment) {
+                continue;
+            }
+            hit(HTML_COMMENT, comment.split_whitespace().collect::<Vec<_>>().join(" "));
+            found += 1;
+            if found >= 3 {
+                break;
+            }
+        }
+    }
+    if html && https {
+        let mut found = 0;
+        for c in MIXED_CONTENT_RE.captures_iter(&body) {
+            let tag = c[0].to_ascii_lowercase();
+            // link は読み込むもの（stylesheet など）だけ。canonical / alternate などはただのリンク
+            if tag.starts_with("<link") && !["stylesheet", "preload", "import", "modulepreload"].iter().any(|r| tag.contains(r)) {
+                continue;
+            }
+            hit(MIXED_CONTENT, c[1].to_string());
+            found += 1;
+            if found >= 3 {
+                break;
+            }
+        }
+    }
     // 接続先自体が内部アドレスなら、本文に内部アドレスが出るのは当たり前なので見ない
     if !x.host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_private()) {
         let mut seen = 0;
@@ -317,6 +436,78 @@ pub fn scan(x: &Exchange<'_>) -> Vec<Hit> {
         }
     }
     hits
+}
+
+/// `text` に含まれる JWT を調べる（alg: none・推測しやすい秘密鍵・有効期限なし）。`place` は見つかった場所。
+fn check_jwts(text: &str, place: &str, seen: &mut HashSet<String>, hit: &mut impl FnMut(&'static Check, String)) {
+    for m in JWT_RE.find_iter(text).take(20) {
+        let token = m.as_str();
+        if !seen.insert(token.to_string()) {
+            continue;
+        }
+        let mut parts = token.splitn(3, '.');
+        let (Some(h), Some(p), Some(s)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let Some(header) = base64url(h).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else {
+            continue;
+        };
+        let alg = header.get("alg").and_then(|a| a.as_str()).unwrap_or("");
+        let hmac_alg = match alg {
+            "HS256" => Some(ring::hmac::HMAC_SHA256),
+            "HS384" => Some(ring::hmac::HMAC_SHA384),
+            "HS512" => Some(ring::hmac::HMAC_SHA512),
+            _ => None,
+        };
+        if alg.eq_ignore_ascii_case("none") {
+            hit(JWT_NONE, format!("{place}: alg={alg}"));
+        } else if let Some(hmac_alg) = hmac_alg
+            && let Some(sig) = base64url(s)
+        {
+            let signed = &token[..h.len() + 1 + p.len()];
+            if let Some(secret) = WEAK_JWT_SECRETS
+                .iter()
+                .find(|k| ring::hmac::verify(&ring::hmac::Key::new(hmac_alg, k.as_bytes()), signed.as_bytes(), &sig).is_ok())
+            {
+                hit(JWT_WEAK_SECRET, format!("{place}: {alg} の秘密鍵 \"{secret}\""));
+            }
+        }
+        let payload = base64url(p).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        if payload.as_ref().and_then(|v| v.as_object()).is_some_and(|o| !o.contains_key("exp")) {
+            hit(JWT_NO_EXP, format!("{place}: alg={alg}"));
+        }
+    }
+}
+
+/// Base64（URL 安全・標準のどちらも、パディングは省略可）。
+fn base64url(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// `i` 以下で最も近い文字の境界。
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 fn is_text_type(ct: &str) -> bool {
@@ -401,8 +592,8 @@ mod tests {
         assert_eq!(
             ids(&hits),
             [
-                "clickjacking", "cookie-no-httponly", "cookie-no-samesite", "cookie-no-secure", "csp-missing",
-                "hsts-missing", "nosniff-missing", "sensitive-query", "server-version"
+                "cache-sensitive", "clickjacking", "cookie-no-httponly", "cookie-no-samesite", "cookie-no-secure",
+                "csp-missing", "hsts-missing", "nosniff-missing", "sensitive-query", "server-version"
             ]
         );
         assert!(hits.iter().all(|h| h.detail != "old"), "削除用の Cookie は対象外");
@@ -413,8 +604,79 @@ mod tests {
     fn well_configured_response_is_quiet() {
         let res = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nStrict-Transport-Security: max-age=1\r\n\
                     Content-Security-Policy: default-src 'self'; frame-ancestors 'none'\r\nX-Content-Type-Options: nosniff\r\n\
-                    Set-Cookie: SID=abc; Secure; HttpOnly; SameSite=Lax\r\nServer: nginx\r\n\r\n";
-        assert!(scan(&exchange("https", "/", b"GET / HTTP/1.1\r\n\r\n", res, b"<p>ok 1.2.3.4 192.168.1.10.5</p>")).is_empty());
+                    Set-Cookie: SID=abc; Secure; HttpOnly; SameSite=Lax\r\nServer: nginx\r\nCache-Control: no-store\r\n\r\n";
+        let body = b"<p>ok 1.2.3.4 192.168.1.10.5</p><!-- header --><!--[if IE]>debug<![endif]-->\
+                     <link rel=canonical href=http://example.com/><script src=https://cdn.example.com/a.js></script>";
+        assert!(scan(&exchange("https", "/", b"GET / HTTP/1.1\r\n\r\n", res, body)).is_empty());
+    }
+
+    /// テスト用に JWT を作る（`secret` が Some なら HS256 で署名、None なら alg: none）。
+    fn jwt(payload: &str, secret: Option<&str>) -> String {
+        fn b64(b: &[u8]) -> String {
+            const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for c in b.chunks(3) {
+                let n = c.iter().enumerate().fold(0u32, |n, (i, &x)| n | (u32::from(x) << (16 - 8 * i)));
+                for i in 0..=c.len() {
+                    out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+                }
+            }
+            out
+        }
+        let header = if secret.is_some() { r#"{"alg":"HS256","typ":"JWT"}"# } else { r#"{"alg":"none"}"# };
+        let signed = format!("{}.{}", b64(header.as_bytes()), b64(payload.as_bytes()));
+        let sig = secret.map_or(String::new(), |k| {
+            b64(ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA256, k.as_bytes()), signed.as_bytes()).as_ref())
+        });
+        format!("{signed}.{sig}")
+    }
+
+    #[test]
+    fn jwt_checks() {
+        let base64 = base64url("eyJhbGciOiJIUzI1NiJ9").unwrap();
+        assert_eq!(base64, br#"{"alg":"HS256"}"#);
+
+        let weak = jwt(r#"{"sub":"a","exp":1}"#, Some("secret"));
+        let strong = jwt(r#"{"sub":"a","exp":1}"#, Some("k9$Lq2!vZ7xR-unguessable"));
+        let none = jwt(r#"{"sub":"a"}"#, None);
+        let req = format!("GET / HTTP/1.1\r\nAuthorization: Bearer {weak}\r\nCookie: s={none}; t={strong}\r\n\r\n");
+        let res = b"HTTP/1.1 204 No Content\r\n\r\n";
+        let hits = scan(&exchange("https", "/", req.as_bytes(), res, b""));
+        assert_eq!(ids(&hits), ["jwt-alg-none", "jwt-no-exp", "jwt-weak-secret"]);
+        assert!(hits.iter().any(|h| h.check.id == "jwt-weak-secret" && h.detail == "リクエスト: HS256 の秘密鍵 \"secret\""));
+        assert_eq!(hits.iter().filter(|h| h.check.id == "jwt-weak-secret").count(), 1, "強い鍵は検出しない");
+
+        // レスポンスの Body（ログインの応答など）も調べる
+        let body = format!(r#"{{"token":"{}"}}"#, jwt(r#"{"sub":"b"}"#, Some("your-256-bit-secret")));
+        let res = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\n\r\n";
+        let hits = scan(&exchange("https", "/login", b"POST /login HTTP/1.1\r\n\r\n", res, body.as_bytes()));
+        assert_eq!(ids(&hits), ["jwt-no-exp", "jwt-weak-secret"]);
+    }
+
+    #[test]
+    fn cache_source_map_comment_and_mixed_content() {
+        let req = b"GET /api/me HTTP/1.1\r\nAuthorization: Bearer x\r\n\r\n";
+        let res = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nCache-Control: max-age=60\r\n\r\n";
+        let hits = scan(&exchange("https", "/api/me", req, res, b"{}"));
+        assert_eq!(ids(&hits), ["cache-sensitive"]);
+        assert_eq!(hits[0].detail, "/api/me（Authorization 付きのリクエスト）");
+
+        let res = b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nX-Content-Type-Options: nosniff\r\n\r\n";
+        let hits = scan(&exchange("https", "/app.js", b"GET /app.js HTTP/1.1\r\n\r\n", res, b"x();\n//# sourceMappingURL=app.js.map"));
+        assert_eq!(hits.iter().map(|h| (h.check.id, h.detail.as_str())).collect::<Vec<_>>(), [("source-map", "app.js.map")]);
+        let res = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Content-Type-Options: nosniff\r\n\r\n";
+        let map = br#"{"version":3,"sources":["a.ts"],"mappings":"AAAA"}"#;
+        let hits = scan(&exchange("https", "/app.js.map", b"GET /app.js.map HTTP/1.1\r\n\r\n", res, map));
+        assert_eq!(ids(&hits), ["source-map"]);
+
+        let res = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nStrict-Transport-Security: max-age=1\r\n\
+                    Content-Security-Policy: frame-ancestors 'none'\r\nX-Content-Type-Options: nosniff\r\n\r\n";
+        let body = b"<!-- TODO: remove test account admin/admin --><!-- nav -->\
+                     <script src=\"http://cdn.example.com/a.js\"></script><link rel=stylesheet href='http://x.test/a.css'>";
+        let hits = scan(&exchange("https", "/", b"GET / HTTP/1.1\r\n\r\n", res, body));
+        assert_eq!(ids(&hits), ["html-comment", "mixed-content"]);
+        assert!(hits.iter().any(|h| h.check.id == "html-comment" && h.detail == "TODO: remove test account admin/admin"));
+        assert_eq!(hits.iter().filter(|h| h.check.id == "mixed-content").count(), 2);
     }
 
     #[test]
