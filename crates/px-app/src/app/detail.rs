@@ -484,7 +484,7 @@ impl PxApp {
     fn replace_selection(&mut self, new: String) {
         let Some(t) = &mut self.codec.target else { return };
         let text = match t.at {
-            EditTarget::Held(id) => self.editors.get_mut(&id).map(|e| &mut e.text),
+            EditTarget::Held(id) => self.intercept.editors.get_mut(&id).map(|e| &mut e.text),
             EditTarget::Repeater(id) => self.repeater.text_mut(id),
         };
         self.status = match text {

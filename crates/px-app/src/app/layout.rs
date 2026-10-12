@@ -11,9 +11,9 @@ use super::{PxApp, Tab};
 impl PxApp {
     pub(super) fn handle_keys(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input()
-            || self.ids.is_empty()
+            || self.history.ids.is_empty()
             || self.new_project.is_some()
-            || self.confirm_delete.is_some()
+            || self.history.confirm_delete.is_some()
             || !self.tab.has_list()
         {
             return;
@@ -23,8 +23,8 @@ impl PxApp {
             return;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
-            let ids: Vec<i64> = match (self.picked.is_empty(), self.selected) {
-                (false, _) => self.picked.iter().copied().collect(),
+            let ids: Vec<i64> = match (self.history.picked.is_empty(), self.selected) {
+                (false, _) => self.history.picked.iter().copied().collect(),
                 (true, Some(id)) => vec![id],
                 (true, None) => return,
             };
@@ -36,16 +36,16 @@ impl PxApp {
         if !up && !down {
             return;
         }
-        let cur = self.selected.and_then(|id| self.ids.binary_search(&id).ok());
+        let cur = self.selected.and_then(|id| self.history.ids.binary_search(&id).ok());
         let next = match (cur, down) {
-            (None, _) => self.ids.len() - 1,
-            (Some(i), true) => (i + 1).min(self.ids.len() - 1),
+            (None, _) => self.history.ids.len() - 1,
+            (Some(i), true) => (i + 1).min(self.history.ids.len() - 1),
             (Some(i), false) => i.saturating_sub(1),
         };
-        self.follow = false;
-        self.scroll_to = Some(next);
-        self.pick_only(self.ids[next]);
-        self.select(self.ids[next]);
+        self.history.follow = false;
+        self.history.scroll_to = Some(next);
+        self.pick_only(self.history.ids[next]);
+        self.select(self.history.ids[next]);
     }
 
     pub(super) fn menu_bar(&mut self, ui: &mut egui::Ui) {
@@ -156,20 +156,20 @@ impl PxApp {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if has_project {
-                    ui.checkbox(&mut self.follow, "末尾に追従");
+                    ui.checkbox(&mut self.history.follow, "末尾に追従");
                     ui.separator();
-                    if self.applied.is_default() {
-                        ui.label(format!("{} 件", self.total));
+                    if self.history.applied.is_default() {
+                        ui.label(format!("{} 件", self.history.total));
                     } else {
-                        ui.label(format!("{} / {} 件", self.ids.len(), self.total));
+                        ui.label(format!("{} / {} 件", self.history.ids.len(), self.history.total));
                     }
-                    if self.scanning {
-                        ui.label(RichText::new(format!("本文を検索中… #{} まで", self.last_id)).weak());
+                    if self.history.scanning {
+                        ui.label(RichText::new(format!("本文を検索中… #{} まで", self.history.last_id)).weak());
                         ui.spinner();
                     }
-                    if self.picked.len() > 1 {
+                    if self.history.picked.len() > 1 {
                         ui.separator();
-                        ui.label(format!("{} 件を選択中", self.picked.len()))
+                        ui.label(format!("{} 件を選択中", self.history.picked.len()))
                             .on_hover_text("右クリックで色付け・削除（Ctrl+クリックで追加 / 解除、Shift+クリックで範囲、Ctrl+A ですべて）");
                     }
                 }
@@ -179,7 +179,7 @@ impl PxApp {
 
     pub(super) fn tab_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let n = self.held.len();
+            let n = self.intercept.held.len();
             let intercept = if n > 0 {
                 RichText::new(format!("Intercept ({n})")).color(yellow(ui)).strong()
             } else {

@@ -18,26 +18,22 @@ mod smoke_tests;
 mod style;
 mod tasks;
 
-use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
 
-use px_proxy::{CertAuthority, Held, ProjectSettings, ProxyContext, ProxyServer};
-use px_store::{Filter, FlowSummary, Project, Reader};
+use px_proxy::{CertAuthority, ProjectSettings, ProxyContext, ProxyServer};
+use px_store::{Project, Reader};
 
 use comparer_tab::Comparer;
 use detail::{CodecWindow, Detail, Search, Selection, ViewMode};
-use filter_bar::FilterForm;
 use findings_tab::Findings;
-use history_tab::NoteEdit;
-use intercept_tab::Editor;
+use history_tab::HistoryState;
+use intercept_tab::InterceptState;
 use prefs::UiPrefs;
 use project::{NewProjectForm, load_recent};
 use repeater_tab::Repeater;
-use rows::DeleteRequest;
 use sitemap_tab::SiteMap;
 use tasks::BgTask;
 
@@ -81,32 +77,10 @@ pub struct PxApp {
     recent: Vec<PathBuf>,
     new_project: Option<NewProjectForm>,
 
-    /// フィルタバーの条件
-    filter: Filter,
-    /// フィルタバーの数値の入力欄
-    filter_form: FilterForm,
-    /// 一覧に適用中の条件（フィルタバー + サイトマップで選んだノード）。`ids` はこの条件の結果
-    applied: Filter,
-    /// 現在のフィルタに一致する ID（昇順）。行 i は ids[i]。
-    ids: Vec<i64>,
-    /// この ID まで調べた（次はこれより後を取りに行く）
-    last_id: i64,
-    /// 本文検索の途中（記録済みの通信を調べ終えていない）
-    scanning: bool,
-    total: i64,
-    cache: HashMap<i64, FlowSummary>,
-    follow: bool,
+    /// History / サイトマップの一覧
+    history: HistoryState,
     /// 詳細を表示している行
     selected: Option<i64>,
-    /// 一覧で選んだ行（Ctrl / Shift で複数）。色付け・削除の対象
-    picked: BTreeSet<i64>,
-    /// Shift で範囲を選ぶときの起点
-    anchor: Option<i64>,
-    /// 確認待ちの削除
-    confirm_delete: Option<DeleteRequest>,
-    /// 書き込み待ちの削除（その削除で消える ID の 1 つ）。消えたらサイトマップと検出を読み直す
-    pending_deletes: Vec<i64>,
-    scroll_to: Option<usize>,
     detail: Option<Detail>,
     /// 詳細ペインの希望の表示方法 [Request, Response]
     view_pref: [ViewMode; 2],
@@ -114,20 +88,14 @@ pub struct PxApp {
     /// 詳細ペインで最後に選択したテキスト（デコード窓の入力に使う）
     selection: Option<Selection>,
     codec: CodecWindow,
-    /// History の一覧で編集中のメモ
-    note_edit: Option<NoteEdit>,
     /// 実行中のバックグラウンド処理（エクスポート / インポート）
     task: Option<BgTask>,
 
     tab: Tab,
     settings: ProjectSettings,
     settings_error: Option<String>,
-    /// Intercept の停止中キュー（UI 側のコピー）
-    held: Vec<Arc<Held>>,
-    held_version: u64,
-    held_checked: Instant,
-    held_selected: Option<u64>,
-    editors: HashMap<u64, Editor>,
+    /// Intercept の停止中キューと編集中の内容
+    intercept: InterceptState,
     repeater: Repeater,
     site_map: SiteMap,
     findings: Findings,
@@ -158,36 +126,18 @@ impl PxApp {
             egui_ctx,
             recent: load_recent(),
             new_project: None,
-            filter: Filter::default(),
-            filter_form: FilterForm::default(),
-            applied: Filter::default(),
-            ids: Vec::new(),
-            last_id: 0,
-            scanning: false,
-            total: 0,
-            cache: HashMap::new(),
-            follow: true,
+            history: HistoryState::default(),
             selected: None,
-            picked: BTreeSet::new(),
-            anchor: None,
-            confirm_delete: None,
-            pending_deletes: Vec::new(),
-            scroll_to: None,
             detail: None,
             view_pref: [ViewMode::Pretty; 2],
             search: Search::default(),
             selection: None,
             codec: CodecWindow::default(),
-            note_edit: None,
             task: None,
             tab: Tab::History,
             settings: ProjectSettings::default(),
             settings_error: None,
-            held: Vec::new(),
-            held_version: u64::MAX,
-            held_checked: Instant::now(),
-            held_selected: None,
-            editors: HashMap::new(),
+            intercept: InterceptState::default(),
             repeater: Repeater::default(),
             site_map: SiteMap::default(),
             findings: Findings::default(),

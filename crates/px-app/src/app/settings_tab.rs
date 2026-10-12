@@ -32,7 +32,7 @@ impl PxApp {
         if let Err(e) = reader.set_scope(move |host, target| scope.contains(host, target)) {
             self.status = format!("診断対象フィルタの設定に失敗: {e}");
         }
-        if self.filter.in_scope_only {
+        if self.history.filter.in_scope_only {
             self.reset_list();
         }
         if self.site_map.in_scope_only {

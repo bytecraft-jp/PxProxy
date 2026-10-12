@@ -1,15 +1,70 @@
 //! History / サイトマップの通信の一覧（表とメモの編集）。
 
+use std::collections::{BTreeSet, HashMap};
+
 use egui::{Align, Color32, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
-use px_store::{FlowSource, Highlight};
+use px_store::{Filter, FlowSource, FlowSummary, Highlight};
 
-use super::rows::{self, RowAction};
+use super::filter_bar::FilterForm;
+use super::rows::{self, DeleteRequest, RowAction};
 use super::style::{RED, highlight_color, severity_color, status_color, yellow};
 use super::PxApp;
 use crate::view;
 
 const SUMMARY_CACHE_MAX: usize = 20_000;
+
+/// History / サイトマップの一覧の状態。
+pub(super) struct HistoryState {
+    /// フィルタバーの条件
+    pub(super) filter: Filter,
+    /// フィルタバーの数値の入力欄
+    pub(super) filter_form: FilterForm,
+    /// 一覧に適用中の条件（フィルタバー + サイトマップで選んだノード）。`ids` はこの条件の結果
+    pub(super) applied: Filter,
+    /// 現在のフィルタに一致する ID（昇順）。行 i は ids[i]。
+    pub(super) ids: Vec<i64>,
+    /// この ID まで調べた（次はこれより後を取りに行く）
+    pub(super) last_id: i64,
+    /// 本文検索の途中（記録済みの通信を調べ終えていない）
+    pub(super) scanning: bool,
+    pub(super) total: i64,
+    pub(super) cache: HashMap<i64, FlowSummary>,
+    pub(super) follow: bool,
+    /// 一覧で選んだ行（Ctrl / Shift で複数）。色付け・削除の対象
+    pub(super) picked: BTreeSet<i64>,
+    /// Shift で範囲を選ぶときの起点
+    pub(super) anchor: Option<i64>,
+    /// 確認待ちの削除
+    pub(super) confirm_delete: Option<DeleteRequest>,
+    /// 書き込み待ちの削除（その削除で消える ID の 1 つ）。消えたらサイトマップと検出を読み直す
+    pub(super) pending_deletes: Vec<i64>,
+    pub(super) scroll_to: Option<usize>,
+    /// 編集中のメモ
+    pub(super) note_edit: Option<NoteEdit>,
+}
+
+impl Default for HistoryState {
+    fn default() -> Self {
+        Self {
+            filter: Filter::default(),
+            filter_form: FilterForm::default(),
+            applied: Filter::default(),
+            ids: Vec::new(),
+            last_id: 0,
+            scanning: false,
+            total: 0,
+            cache: HashMap::new(),
+            follow: true,
+            picked: BTreeSet::new(),
+            anchor: None,
+            confirm_delete: None,
+            pending_deletes: Vec::new(),
+            scroll_to: None,
+            note_edit: None,
+        }
+    }
+}
 
 /// History の一覧でメモを編集中の行。
 pub(super) struct NoteEdit {
@@ -29,7 +84,7 @@ impl PxApp {
             .resizable(true)
             .sense(egui::Sense::click())
             .cell_layout(Layout::left_to_right(Align::Center))
-            .stick_to_bottom(self.follow)
+            .stick_to_bottom(self.history.follow)
             .column(Column::exact(60.0))
             .column(Column::exact(112.0))
             .column(Column::initial(240.0).clip(true))
@@ -41,15 +96,13 @@ impl PxApp {
             .column(Column::exact(64.0))
             .column(Column::initial(160.0).clip(true))
             .column(Column::remainder().at_least(120.0).clip(true));
-        if let Some(i) = self.scroll_to.take() {
+        if let Some(i) = self.history.scroll_to.take() {
             table = table.scroll_to_row(i, None);
         }
 
-        let ids = &self.ids;
-        let cache = &mut self.cache;
+        let HistoryState { ids, cache, picked, note_edit, .. } = &mut self.history;
         let reader = self.reader.as_ref();
         let selected = self.selected;
-        let picked = &self.picked;
         let shown = ids.len();
         // (行, クリックしたときの修飾キー)
         let mut clicked: Option<(i64, egui::Modifiers)> = None;
@@ -58,7 +111,6 @@ impl PxApp {
         let mut passthrough_add: Option<String> = None;
         let mut to_repeater = None;
         let mut to_comparer = None;
-        let note_edit = &mut self.note_edit;
         // (id, 確定したメモ)。None は取り消し
         let mut note_done: Option<Option<(i64, String)>> = None;
         let mut note_start = None;
@@ -269,14 +321,14 @@ impl PxApp {
             self.send_to_comparer(id);
         }
         if let Some(done) = note_done {
-            self.note_edit = None;
+            self.history.note_edit = None;
             if let Some((id, text)) = done {
                 self.save_note(id, text);
             }
         }
         if let Some(id) = note_start {
-            let text = self.cache.get(&id).and_then(|s| s.note.clone()).unwrap_or_default();
-            self.note_edit = Some(NoteEdit { id, text, focus: true });
+            let text = self.history.cache.get(&id).and_then(|s| s.note.clone()).unwrap_or_default();
+            self.history.note_edit = Some(NoteEdit { id, text, focus: true });
         }
     }
 
@@ -284,11 +336,11 @@ impl PxApp {
     pub(super) fn save_note(&mut self, id: i64, text: String) {
         let Some(project) = &self.project else { return };
         let text = text.trim().to_owned();
-        if self.cache.get(&id).is_some_and(|s| s.note.as_deref().unwrap_or("") == text) {
+        if self.history.cache.get(&id).is_some_and(|s| s.note.as_deref().unwrap_or("") == text) {
             return;
         }
         project.sink().set_note(id, &text);
-        if let Some(s) = self.cache.get_mut(&id) {
+        if let Some(s) = self.history.cache.get_mut(&id) {
             s.note = (!text.is_empty()).then_some(text);
         }
     }

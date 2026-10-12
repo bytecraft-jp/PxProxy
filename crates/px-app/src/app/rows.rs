@@ -45,19 +45,19 @@ fn update_picked(picked: &mut BTreeSet<i64>, anchor: &mut Option<i64>, ids: &[i6
 impl PxApp {
     /// 行のクリック（選択と詳細の表示）。
     pub(super) fn click_row(&mut self, id: i64, modifiers: Modifiers) {
-        update_picked(&mut self.picked, &mut self.anchor, &self.ids, id, modifiers);
-        self.follow = false;
+        update_picked(&mut self.history.picked, &mut self.history.anchor, &self.history.ids, id, modifiers);
+        self.history.follow = false;
         self.select(id);
     }
 
     /// 1 行だけを選ぶ（矢印キーなど）。
     pub(super) fn pick_only(&mut self, id: i64) {
-        update_picked(&mut self.picked, &mut self.anchor, &self.ids, id, Modifiers::NONE);
+        update_picked(&mut self.history.picked, &mut self.history.anchor, &self.history.ids, id, Modifiers::NONE);
     }
 
     pub(super) fn select_all_rows(&mut self) {
-        self.picked = self.ids.iter().copied().collect();
-        self.anchor = self.ids.first().copied();
+        self.history.picked = self.history.ids.iter().copied().collect();
+        self.history.anchor = self.history.ids.first().copied();
     }
 
     /// 行に色を付ける（None で外す）。一覧にはすぐ反映する。
@@ -65,7 +65,7 @@ impl PxApp {
     pub(super) fn set_color(&mut self, ids: Vec<i64>, color: Option<Highlight>) {
         let Some(project) = &self.project else { return };
         for id in &ids {
-            if let Some(s) = self.cache.get_mut(id) {
+            if let Some(s) = self.history.cache.get_mut(id) {
                 s.color = color;
             }
         }
@@ -83,7 +83,7 @@ impl PxApp {
             self.status = format!("{what}はありません");
             return;
         }
-        self.confirm_delete = Some(DeleteRequest { ids, what });
+        self.history.confirm_delete = Some(DeleteRequest { ids, what });
     }
 
     /// 診断対象外の通信をすべて削除する（確認あり）。
@@ -102,38 +102,38 @@ impl PxApp {
         let n = ids.len();
         let gone: HashSet<i64> = ids.iter().copied().collect();
         project.sink().delete(ids);
-        self.pending_deletes.push(probe);
-        self.ids.retain(|id| !gone.contains(id));
-        self.cache.retain(|id, _| !gone.contains(id));
-        self.picked.retain(|id| !gone.contains(id));
-        if self.anchor.is_some_and(|a| gone.contains(&a)) {
-            self.anchor = None;
+        self.history.pending_deletes.push(probe);
+        self.history.ids.retain(|id| !gone.contains(id));
+        self.history.cache.retain(|id, _| !gone.contains(id));
+        self.history.picked.retain(|id| !gone.contains(id));
+        if self.history.anchor.is_some_and(|a| gone.contains(&a)) {
+            self.history.anchor = None;
         }
         if self.selected.is_some_and(|s| gone.contains(&s)) {
             self.forget_detail_images();
             self.detail = None;
             self.selected = None;
         }
-        if self.note_edit.as_ref().is_some_and(|e| gone.contains(&e.id)) {
-            self.note_edit = None;
+        if self.history.note_edit.as_ref().is_some_and(|e| gone.contains(&e.id)) {
+            self.history.note_edit = None;
         }
         self.status = format!("{n} 件の通信を削除しました");
     }
 
     /// 削除が書き込まれたら（確かめに使う ID が消えたら）、サイトマップと検出を読み直す。
     pub(super) fn finish_deletes(&mut self, reader: &Reader) {
-        if self.pending_deletes.is_empty() {
+        if self.history.pending_deletes.is_empty() {
             return;
         }
-        self.pending_deletes.retain(|id| reader.summary(*id).ok().flatten().is_some());
-        if self.pending_deletes.is_empty() {
+        self.history.pending_deletes.retain(|id| reader.summary(*id).ok().flatten().is_some());
+        if self.history.pending_deletes.is_empty() {
             self.site_map.reset();
             self.findings.reload();
         }
     }
 
     pub(super) fn delete_confirm_window(&mut self, ctx: &egui::Context) {
-        let Some(req) = &self.confirm_delete else { return };
+        let Some(req) = &self.history.confirm_delete else { return };
         let mut decided = None;
         let modal = egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
             ui.set_max_width(420.0);
@@ -156,10 +156,10 @@ impl PxApp {
         }
         match decided {
             Some(true) => {
-                let req = self.confirm_delete.take().expect("shown above");
+                let req = self.history.confirm_delete.take().expect("shown above");
                 self.delete_flows(req.ids);
             }
-            Some(false) => self.confirm_delete = None,
+            Some(false) => self.history.confirm_delete = None,
             None => {}
         }
     }
@@ -169,8 +169,8 @@ impl PxApp {
             RowAction::Color(ids, color) => self.set_color(ids, color),
             RowAction::Delete(ids, what) => self.request_delete(ids, what),
             RowAction::DeleteShown => {
-                let what = if self.scanning { "一覧に表示中（本文の検索途中）の通信" } else { "一覧に表示中の通信" };
-                self.request_delete(self.ids.clone(), what.into());
+                let what = if self.history.scanning { "一覧に表示中（本文の検索途中）の通信" } else { "一覧に表示中の通信" };
+                self.request_delete(self.history.ids.clone(), what.into());
             }
             RowAction::DeleteOutOfScope => self.request_delete_out_of_scope(),
         }

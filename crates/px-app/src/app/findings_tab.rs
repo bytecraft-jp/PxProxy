@@ -155,7 +155,7 @@ impl PxApp {
         let mut to_comparer = None;
         let items = &self.findings.items;
         let reader = self.reader.as_ref();
-        let cache = &mut self.cache;
+        let cache = &mut self.history.cache;
         let selected = self.selected;
         ui.style_mut().interaction.selectable_labels = false;
         TableBuilder::new(ui)

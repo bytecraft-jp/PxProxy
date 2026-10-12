@@ -1,6 +1,7 @@
 //! Intercept タブ: 停止中キューと編集画面。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText};
@@ -16,6 +17,22 @@ const FORWARD_KEY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key
 const DROP_KEY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::D);
 /// 接続切れで待ち手のいなくなった項目を掃除する間隔
 const PRUNE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Intercept の停止中キュー（UI 側のコピー）と編集中の内容。
+pub(super) struct InterceptState {
+    pub(super) held: Vec<Arc<Held>>,
+    /// 最後に読んだキューの版
+    pub(super) version: u64,
+    pub(super) checked: Instant,
+    pub(super) selected: Option<u64>,
+    pub(super) editors: HashMap<u64, Editor>,
+}
+
+impl Default for InterceptState {
+    fn default() -> Self {
+        Self { held: Vec::new(), version: u64::MAX, checked: Instant::now(), selected: None, editors: HashMap::new() }
+    }
+}
 
 /// 停止中メッセージの編集状態。
 pub(super) struct Editor {
@@ -116,36 +133,36 @@ impl PxApp {
     /// キューの変化を取り込む。新着があり設定が有効なら Intercept タブへ切り替える。
     pub(super) fn refresh_held(&mut self) {
         let it = self.ctx.interceptor();
-        let stale = !self.held.is_empty() && self.held_checked.elapsed() >= PRUNE_INTERVAL;
-        if it.version() == self.held_version && !stale {
+        let stale = !self.intercept.held.is_empty() && self.intercept.checked.elapsed() >= PRUNE_INTERVAL;
+        if it.version() == self.intercept.version && !stale {
             return;
         }
-        let known: HashSet<u64> = self.held.iter().map(|h| h.id).collect();
-        self.held = it.pending();
-        self.held_version = it.version();
-        self.held_checked = Instant::now();
+        let known: HashSet<u64> = self.intercept.held.iter().map(|h| h.id).collect();
+        self.intercept.held = it.pending();
+        self.intercept.version = it.version();
+        self.intercept.checked = Instant::now();
 
-        let ids: HashSet<u64> = self.held.iter().map(|h| h.id).collect();
-        self.editors.retain(|id, _| ids.contains(id));
-        for h in &self.held {
-            self.editors.entry(h.id).or_insert_with(|| Editor::new(h));
+        let ids: HashSet<u64> = self.intercept.held.iter().map(|h| h.id).collect();
+        self.intercept.editors.retain(|id, _| ids.contains(id));
+        for h in &self.intercept.held {
+            self.intercept.editors.entry(h.id).or_insert_with(|| Editor::new(h));
         }
-        if self.held_selected.is_none_or(|id| !ids.contains(&id)) {
-            self.held_selected = self.held.first().map(|h| h.id);
+        if self.intercept.selected.is_none_or(|id| !ids.contains(&id)) {
+            self.intercept.selected = self.intercept.held.first().map(|h| h.id);
         }
-        let arrived = self.held.iter().any(|h| !known.contains(&h.id));
+        let arrived = self.intercept.held.iter().any(|h| !known.contains(&h.id));
         if arrived && self.settings.intercept.switch_to_tab {
             self.tab = Tab::Intercept;
         }
-        if !self.held.is_empty() {
+        if !self.intercept.held.is_empty() {
             self.egui_ctx.request_repaint_after(PRUNE_INTERVAL);
         }
     }
 
     fn resolve_selected(&mut self, drop: bool) {
-        let Some(id) = self.held_selected else { return };
-        let is_request = self.held.iter().find(|h| h.id == id).is_none_or(|h| h.direction == Direction::Request);
-        let decision = match (drop, self.editors.get_mut(&id)) {
+        let Some(id) = self.intercept.selected else { return };
+        let is_request = self.intercept.held.iter().find(|h| h.id == id).is_none_or(|h| h.direction == Direction::Request);
+        let decision = match (drop, self.intercept.editors.get_mut(&id)) {
             (true, _) => Decision::Drop,
             (false, Some(e)) => {
                 let edited = e.edited();
@@ -164,21 +181,21 @@ impl PxApp {
         if !self.ctx.interceptor().resolve(id, decision) {
             self.status = "接続が既に切れていました".into();
         }
-        let pos = self.held.iter().position(|h| h.id == id).unwrap_or(0);
-        self.held.retain(|h| h.id != id);
-        self.editors.remove(&id);
-        self.held_selected = self.held.get(pos.min(self.held.len().saturating_sub(1))).map(|h| h.id);
+        let pos = self.intercept.held.iter().position(|h| h.id == id).unwrap_or(0);
+        self.intercept.held.retain(|h| h.id != id);
+        self.intercept.editors.remove(&id);
+        self.intercept.selected = self.intercept.held.get(pos.min(self.intercept.held.len().saturating_sub(1))).map(|h| h.id);
     }
 
     /// 選択中の停止リクエストを（編集中の内容のまま）Repeater に送る。停止中のものはそのまま残す。
     fn intercept_to_repeater(&mut self) {
-        let Some(id) = self.held_selected else { return };
-        let Some(h) = self.held.iter().find(|h| h.id == id) else { return };
+        let Some(id) = self.intercept.selected else { return };
+        let Some(h) = self.intercept.held.iter().find(|h| h.id == id) else { return };
         if h.direction != Direction::Request {
             self.status = "Repeater に送れるのはリクエストだけです".into();
             return;
         }
-        let Some(e) = self.editors.get(&id) else { return };
+        let Some(e) = self.intercept.editors.get(&id) else { return };
         let origin = Origin { https: h.scheme == "https", host: h.host.clone(), port: h.port };
         let title = format!("{} {}", h.method, h.host);
         let (text, binary) = (e.text.clone(), e.binary_body.clone());
@@ -202,7 +219,7 @@ impl PxApp {
         }
 
         let enabled = self.ctx.interceptor().is_enabled();
-        let selected = self.held_selected.and_then(|id| self.held.iter().find(|h| h.id == id).cloned());
+        let selected = self.intercept.selected.and_then(|id| self.intercept.held.iter().find(|h| h.id == id).cloned());
         let mut to_repeater = false;
         ui.horizontal(|ui| {
             let (label, color) = if enabled { ("● Intercept ON", GREEN) } else { ("○ Intercept OFF", Color32::GRAY) };
@@ -218,12 +235,12 @@ impl PxApp {
             if ui.add_enabled(has, egui::Button::new("Drop")).on_hover_text("Ctrl+D").clicked() {
                 self.resolve_selected(true);
             }
-            if ui.add_enabled(!self.held.is_empty(), egui::Button::new("すべて Forward")).clicked() {
+            if ui.add_enabled(!self.intercept.held.is_empty(), egui::Button::new("すべて Forward")).clicked() {
                 self.ctx.interceptor().forward_all();
             }
             ui.separator();
             if let Some(h) = &selected
-                && let Some(editor) = self.editors.get_mut(&h.id)
+                && let Some(editor) = self.intercept.editors.get_mut(&h.id)
             {
                 if h.direction == Direction::Request {
                     ui.checkbox(&mut editor.intercept_response, "このレスポンスも止める");
@@ -254,7 +271,7 @@ impl PxApp {
         }
         ui.separator();
 
-        if self.held.is_empty() {
+        if self.intercept.held.is_empty() {
             ui.centered_and_justified(|ui| {
                 let msg = if enabled {
                     "停止中の通信はありません。ルールに一致した通信がここに表示されます"
@@ -267,17 +284,17 @@ impl PxApp {
         }
 
         egui::Panel::left("held_list").resizable(true).default_size(340.0).min_size(200.0).show(ui, |ui| {
-            ui.strong(format!("停止中 {} 件", self.held.len()));
+            ui.strong(format!("停止中 {} 件", self.intercept.held.len()));
             ui.add_space(4.0);
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                for h in &self.held {
+                for h in &self.intercept.held {
                     let text = RichText::new(held_label(h)).color(match h.direction {
                         Direction::Request => ui.visuals().text_color(),
                         Direction::Response => Color32::from_rgb(100, 160, 240),
                     });
-                    let resp = ui.add(egui::Button::selectable(self.held_selected == Some(h.id), text).truncate());
+                    let resp = ui.add(egui::Button::selectable(self.intercept.selected == Some(h.id), text).truncate());
                     if resp.clicked() {
-                        self.held_selected = Some(h.id);
+                        self.intercept.selected = Some(h.id);
                     }
                 }
             });
@@ -285,7 +302,7 @@ impl PxApp {
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let Some(h) = selected else { return };
-            let Some(editor) = self.editors.get_mut(&h.id) else { return };
+            let Some(editor) = self.intercept.editors.get_mut(&h.id) else { return };
             ui.horizontal(|ui| {
                 let kind = if h.direction == Direction::Request { "リクエスト" } else { "レスポンス" };
                 ui.strong(kind);

@@ -91,7 +91,7 @@ fn every_tab_renders_recorded_traffic() {
         .with_size([1400.0, 900.0])
         .build_eframe(|cc| PxApp::new(cc.egui_ctx.clone(), opts).expect("アプリを起動できる"));
     h.run_steps(3);
-    assert_eq!(h.state().ids.len(), 5, "History に記録が並ぶ");
+    assert_eq!(h.state().history.ids.len(), 5, "History に記録が並ぶ");
     assert!(has_label(&h, "10-08"), "時刻の列");
     assert!(has_label(&h, "TLS パススルー") && has_label(&h, "一部のみ記録"), "備考");
 
@@ -117,11 +117,11 @@ fn every_tab_renders_recorded_traffic() {
     h.state_mut().site_map.selected =
         Some(SiteFilter { scheme: "https".into(), host: "example.com".into(), port: 443, path: "/a".into() });
     h.run_steps(3);
-    assert_eq!(h.state().ids, [1, 2]);
+    assert_eq!(h.state().history.ids, [1, 2]);
     // History に戻るとノードの絞り込みは外れる
     h.state_mut().tab = Tab::History;
     h.run_steps(2);
-    assert_eq!(h.state().ids.len(), 5);
+    assert_eq!(h.state().history.ids.len(), 5);
 
     // Comparer
     h.state_mut().send_to_comparer(1);
@@ -158,39 +158,39 @@ fn every_tab_renders_recorded_traffic() {
 
     // History の詳細条件: 本文検索（JSON の中身）。詳細条件の行も描画できる
     h.state_mut().tab = Tab::History;
-    h.state_mut().filter_form.expanded = true;
-    h.state_mut().filter.content.text = "ALICE".into();
+    h.state_mut().history.filter_form.expanded = true;
+    h.state_mut().history.filter.content.text = "ALICE".into();
     h.run_steps(3);
-    assert_eq!(h.state().ids, [2], "大文字小文字を無視して Body を探す");
+    assert_eq!(h.state().history.ids, [2], "大文字小文字を無視して Body を探す");
     assert!(has_label(&h, "所要時間") && has_label(&h, "詳細条件 (1)"));
-    h.state_mut().filter.content.regex = true;
-    h.state_mut().filter.content.text = "(".into();
+    h.state_mut().history.filter.content.regex = true;
+    h.state_mut().history.filter.content.text = "(".into();
     h.run_steps(2);
-    assert_eq!(h.state().ids, [2], "正規表現が誤っていれば前の条件のまま");
+    assert_eq!(h.state().history.ids, [2], "正規表現が誤っていれば前の条件のまま");
     assert!(has_label(&h, "本文検索の正規表現"));
-    h.state_mut().filter = Filter::default();
+    h.state_mut().history.filter = Filter::default();
     h.run_steps(2);
-    assert_eq!(h.state().ids.len(), 5);
+    assert_eq!(h.state().history.ids.len(), 5);
 
     // 複数選択して色を付け、色で絞り込む
     h.state_mut().click_row(1, Modifiers::NONE);
     h.state_mut().click_row(2, Modifiers { shift: true, ..Modifiers::NONE });
-    assert_eq!(h.state().picked.iter().copied().collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(h.state().history.picked.iter().copied().collect::<Vec<_>>(), [1, 2]);
     h.state_mut().set_color(vec![1, 2], Some(Highlight::Red));
-    h.state_mut().filter.colors = Highlight::Red.bit();
-    wait_until(&mut h, |a| a.ids == [1, 2]);
+    h.state_mut().history.filter.colors = Highlight::Red.bit();
+    wait_until(&mut h, |a| a.history.ids == [1, 2]);
 
     // 削除は確認してから。消えた行はサイトマップからも消える
-    h.state_mut().filter = Filter::default();
+    h.state_mut().history.filter = Filter::default();
     h.run_steps(2);
     h.state_mut().request_delete(vec![1], "この通信".into());
     h.run_steps(2);
     assert!(has_label(&h, "元に戻せません"));
     h.get_by_label("削除する").click();
     h.run_steps(2);
-    assert!(h.state().confirm_delete.is_none());
-    assert_eq!(h.state().ids, [2, 3, 4, 5]);
-    wait_until(&mut h, |a| a.total == 4 && a.pending_deletes.is_empty());
+    assert!(h.state().history.confirm_delete.is_none());
+    assert_eq!(h.state().history.ids, [2, 3, 4, 5]);
+    wait_until(&mut h, |a| a.history.total == 4 && a.history.pending_deletes.is_empty());
     h.state_mut().tab = Tab::SiteMap;
     h.run_steps(3);
     assert!(has_label(&h, "https://example.com  (1)"), "サイトマップを読み直す");
@@ -222,6 +222,6 @@ fn every_tab_renders_recorded_traffic() {
     h.run_steps(2);
     assert!(empty.join("project.toml").exists());
     assert_eq!(h.state().project.as_ref().map(|p| p.manifest().name.as_str()), Some("empty"));
-    assert!(h.state().ids.is_empty());
+    assert!(h.state().history.ids.is_empty());
     assert!(h.state().status.contains("初期化しました"), "{}", h.state().status);
 }

@@ -90,8 +90,8 @@ fn color_chip(ui: &mut egui::Ui, mask: &mut u32, h: Highlight) {
 
 impl PxApp {
     pub(super) fn filter_bar(&mut self, ui: &mut egui::Ui) {
-        let mut f = self.filter.clone();
-        let form = &mut self.filter_form;
+        let mut f = self.history.filter.clone();
+        let form = &mut self.history.filter_form;
         ui.horizontal_wrapped(|ui| {
             let hint = if f.text_regex { "🔍 ホスト / パス（正規表現）" } else { "🔍 ホスト / パスで絞り込み" };
             ui.add(egui::TextEdit::singleline(&mut f.text).hint_text(hint).desired_width(180.0));
@@ -188,7 +188,7 @@ impl PxApp {
         if let Some(e) = f.error() {
             ui.colored_label(RED, format!("{e}（直す前の条件で表示しています）"));
         }
-        self.filter = f;
+        self.history.filter = f;
     }
 }
 

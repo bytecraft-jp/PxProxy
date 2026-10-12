@@ -76,15 +76,15 @@ impl PxApp {
 
     pub(super) fn close_project(&mut self) {
         // 入力途中のメモは閉じる前の案件に保存する（別の案件の同じ id に書かないように）
-        if let Some(e) = self.note_edit.take() {
+        if let Some(e) = self.history.note_edit.take() {
             self.save_note(e.id, e.text);
         }
         self.stop_proxy();
         // 停止中の通信は全て転送してから閉じる
         self.ctx.interceptor().set_enabled(false);
-        self.held.clear();
-        self.editors.clear();
-        self.held_selected = None;
+        self.intercept.held.clear();
+        self.intercept.editors.clear();
+        self.intercept.selected = None;
         self.clear_repeater();
         self.ctx.set_sink(None);
         self.reader = None;
@@ -93,14 +93,14 @@ impl PxApp {
             self.status = "案件を閉じました".into();
         }
         self.set_title(None);
-        self.ids.clear();
-        self.cache.clear();
-        self.total = 0;
+        self.history.ids.clear();
+        self.history.cache.clear();
+        self.history.total = 0;
         self.forget_detail_images();
         self.detail = None;
         self.selected = None;
-        self.confirm_delete = None;
-        self.pending_deletes.clear();
+        self.history.confirm_delete = None;
+        self.history.pending_deletes.clear();
         self.site_map = SiteMap::default();
         self.findings.clear();
         for uri in self.comparer.image_uris() {

@@ -125,7 +125,7 @@ impl PxApp {
         match action {
             Some(Action::Select(site)) => {
                 self.site_map.selected = site;
-                self.follow = true;
+                self.history.follow = true;
             }
             Some(Action::Scope { host, exclude }) => self.add_scope_host(&host, exclude),
             None => {}
