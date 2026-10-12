@@ -8,7 +8,8 @@ use px_proxy::{Decision, Direction, Held, Origin};
 
 use super::detail::{EditTarget, selection_menu, show_keeping_selection};
 use super::repeater_tab::SEND_TO_REPEATER_KEY;
-use super::{GREEN, PxApp, RED, Tab};
+use super::style::{GREEN, RED, yellow};
+use super::{PxApp, Tab};
 use crate::view;
 
 const FORWARD_KEY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::F);
@@ -290,7 +291,7 @@ impl PxApp {
                 ui.strong(kind);
                 ui.label(format!("{}://{}:{}{}", h.scheme, h.host, h.port, h.target));
                 if editor.text != editor.original {
-                    ui.label(RichText::new("編集済み").color(super::yellow(ui)));
+                    ui.label(RichText::new("編集済み").color(yellow(ui)));
                 }
             });
             if let Some(e) = &editor.error {

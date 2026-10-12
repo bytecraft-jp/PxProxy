@@ -4,7 +4,8 @@ use egui::{Align, Layout, RichText};
 use px_proxy::mock::ROOT_PATH;
 use px_proxy::{MockRoute, MockServer};
 
-use super::{PxApp, RED};
+use super::style::RED;
+use super::PxApp;
 
 /// ボタンで選べるメソッド（これ以外も settings.toml に書けば受け付ける）
 const METHODS: [&str; 7] = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];

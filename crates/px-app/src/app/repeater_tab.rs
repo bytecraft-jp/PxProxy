@@ -9,7 +9,8 @@ use tokio::task::JoinHandle;
 
 use super::detail::{EditTarget, ViewMode, image_view, selection_menu, show_keeping_selection};
 use super::intercept_tab::split_head_body;
-use super::{PxApp, RED, Tab, status_color};
+use super::style::{RED, status_color};
+use super::{PxApp, Tab};
 use crate::highlight::{self, Theme};
 use crate::view::{self, Rendered};
 

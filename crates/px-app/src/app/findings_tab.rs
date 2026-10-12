@@ -6,7 +6,8 @@ use egui::{Align, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
 use px_store::{Finding, FindingGroup, Severity, passive};
 
-use super::{PxApp, status_color};
+use super::style::{severity_color, status_color};
+use super::PxApp;
 
 /// 記録が続いている間に一覧を読み直す間隔
 const RELOAD_INTERVAL: Duration = Duration::from_secs(1);
@@ -104,7 +105,7 @@ impl PxApp {
                 if last != Some(g.severity) {
                     last = Some(g.severity);
                     ui.add_space(4.0);
-                    ui.label(RichText::new(format!("重要度: {}", g.severity.label())).color(super::severity_color(ui, g.severity)).strong());
+                    ui.label(RichText::new(format!("重要度: {}", g.severity.label())).color(severity_color(ui, g.severity)).strong());
                 }
                 let title = passive::check(&g.check).map_or(g.check.as_str(), |c| c.title);
                 let is_sel = f.selected.as_ref().is_some_and(|(c, h)| *c == g.check && *h == g.host);
@@ -136,7 +137,7 @@ impl PxApp {
         let check = passive::check(&check_id);
         ui.horizontal(|ui| {
             if let Some(c) = check {
-                ui.label(RichText::new(format!("[{}]", c.severity.label())).color(super::severity_color(ui, c.severity)).strong());
+                ui.label(RichText::new(format!("[{}]", c.severity.label())).color(severity_color(ui, c.severity)).strong());
                 ui.heading(c.title);
             } else {
                 ui.heading(&check_id);

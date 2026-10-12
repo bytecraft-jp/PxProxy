@@ -7,7 +7,8 @@ use egui::{Align, Color32, Key, KeyboardShortcut, Layout, Modifiers, RichText};
 use egui_extras::{Column, TableBuilder};
 use px_store::{Finding, FlowSummary, Reader, WsMessage};
 
-use super::{GREEN, PxApp, severity_color, yellow};
+use super::style::{GREEN, severity_color, yellow};
+use super::PxApp;
 use crate::codec::{self, Output};
 use crate::highlight::{self, MAX_MATCHES, Theme};
 use crate::view::{self, Rendered};

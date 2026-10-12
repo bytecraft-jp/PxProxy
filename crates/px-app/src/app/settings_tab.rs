@@ -5,7 +5,8 @@ use egui::RichText;
 use px_proxy::{ProjectSettings, ScopeRule};
 use px_store::FlowKind;
 
-use super::{PxApp, RED, chip};
+use super::style::{RED, chip};
+use super::PxApp;
 
 impl PxApp {
     /// 案件の settings.toml を読み込んで反映する（無ければ既定値）。

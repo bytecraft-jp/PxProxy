@@ -5,7 +5,8 @@ use std::collections::{BTreeSet, HashSet};
 use egui::{Key, KeyboardShortcut, Modifiers, RichText};
 use px_store::{Highlight, Reader};
 
-use super::{PxApp, RED, highlight_color};
+use super::style::{RED, highlight_color};
+use super::PxApp;
 
 /// 表示中の行をすべて選ぶ
 pub(super) const SELECT_ALL_KEY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::A);

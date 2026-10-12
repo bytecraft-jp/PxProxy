@@ -7,7 +7,8 @@ use px_store::{
     StatusClass,
 };
 
-use super::{PxApp, RED, chip, highlight_color};
+use super::style::{RED, chip, highlight_color};
+use super::PxApp;
 
 /// 数値の条件の入力欄（空欄は指定なし）。`Filter` には解釈した値を入れる。
 #[derive(Default)]
