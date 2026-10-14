@@ -65,6 +65,15 @@ fn has_label(h: &Harness<'_, PxApp>, text: &str) -> bool {
     h.query_all_by_label_contains(text).next().is_some()
 }
 
+fn drag(h: &mut Harness<'_, PxApp>, from: egui::Pos2, to: egui::Pos2) {
+    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    for e in [egui::Event::PointerMoved(from), button(from, true), egui::Event::PointerMoved(to), button(to, false)] {
+        h.input_mut().events.push(e);
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+}
+
 /// 記録の書き込み（別スレッド）を待ちながら描画を進める。
 fn wait_until(h: &mut Harness<'_, PxApp>, done: impl Fn(&PxApp) -> bool) {
     for _ in 0..200 {
@@ -104,6 +113,13 @@ fn every_tab_renders_recorded_traffic() {
     h.state_mut().select(1);
     h.run_steps(2);
     assert!(has_label(&h, "検出"), "パッシブチェックの検出");
+    // Request / Response の間のつまみをドラッグすると幅が変わる
+    let res = |h: &Harness<'_, PxApp>| h.get_by_label("Response").rect();
+    let before = res(&h);
+    let at = egui::pos2(before.left() - 4.0, before.bottom() + 40.0);
+    drag(&mut h, at, at + egui::vec2(150.0, 0.0));
+    let moved = res(&h).left() - before.left();
+    assert!((140.0..=160.0).contains(&moved), "Response が {moved} だけ右へ動く");
     h.state_mut().select(3);
     h.run_steps(2);
     assert!(has_label(&h, "WebSocket (2)"), "WebSocket のメッセージ");
@@ -129,6 +145,28 @@ fn every_tab_renders_recorded_traffic() {
     h.state_mut().tab = Tab::Comparer;
     h.run_steps(3);
     assert!(has_label(&h, "差分"), "差分の数が出る");
+    // 長い URL を折り返すと Comparer のパネルが左へ広がり、差分の表が画面からはみ出していた
+    for (id, text) in [(901, "a\nb\n"), (902, "a\nc\n")] {
+        let label = format!("#{id} GET www.example.com/search/api/v1/suggestions?query=https%3A%2F%2Fexample.org%2Fabc&types=File;Site;People;Bookmark&scenario=AddressBar&session=00000000-0000-0000-0000-000000000000&request=11111111-1111-1111-1111-111111111111 → 200");
+        let side = || crate::view::Rendered::plain(text.into());
+        h.state_mut().comparer.push(super::comparer_tab::CompareItem::new(id, label, [side(), side()]));
+    }
+    h.run_steps(3);
+    for id in ["#901", "#902"] {
+        let mut nodes = h.query_all_by_label_contains(id).peekable();
+        assert!(nodes.peek().is_some());
+        for n in nodes {
+            let r = n.rect();
+            assert!(r.left() >= 0.0 && r.right() <= 1400.0, "{id} が画面外: {r:?}");
+        }
+    }
+    // A / B の間のつまみ（B の行番号の列のすぐ左）をドラッグすると幅が変わる
+    let b_left = |h: &Harness<'_, PxApp>| h.get_by_label("B").rect().left();
+    let before = b_left(&h);
+    let at = egui::pos2(before - 48.0 - 12.0, 400.0);
+    drag(&mut h, at, at - egui::vec2(200.0, 0.0));
+    let moved = before - b_left(&h);
+    assert!((190.0..=210.0).contains(&moved), "B が {moved} だけ左へ動く");
 
     // 検出
     h.state_mut().tab = Tab::Findings;

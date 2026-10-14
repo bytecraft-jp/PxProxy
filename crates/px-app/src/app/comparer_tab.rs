@@ -8,6 +8,7 @@ use egui::{Align, Color32, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
 
 use super::PxApp;
+use super::split::Split;
 use crate::diff::{self, Diff, Line};
 use crate::view::{self, Rendered};
 
@@ -153,33 +154,12 @@ impl PxApp {
 
     pub(super) fn comparer_tab(&mut self, ui: &mut egui::Ui) {
         let c = &mut self.comparer;
-        ui.horizontal_wrapped(|ui| {
-            let mut remove = None;
-            for (i, name) in ["A", "B"].into_iter().enumerate() {
-                ui.label(RichText::new(name).strong());
-                match &c.slots[i] {
-                    Some(item) => {
-                        ui.label(RichText::new(&item.label).monospace());
-                        if ui.small_button("×").on_hover_text("外す").clicked() {
-                            remove = Some(i);
-                        }
-                    }
-                    None => {
-                        ui.label(RichText::new("（未設定）").weak());
-                    }
-                }
-                ui.separator();
-            }
-            if let Some(i) = remove {
-                c.slots[i] = None;
-                c.diff = None;
-            }
+        ui.horizontal(|ui| {
             if ui.add_enabled(c.len() == 2, egui::Button::new("⇄ 入れ替え")).clicked() {
                 c.slots.swap(0, 1);
                 c.diff = None;
             }
-        });
-        ui.horizontal(|ui| {
+            ui.separator();
             for (part, label) in [(Part::Request, "Request"), (Part::Response, "Response")] {
                 if ui.selectable_label(c.part == part, label).clicked() {
                     c.part = part;
@@ -206,6 +186,15 @@ impl PxApp {
         ui.separator();
 
         let (Some(a), Some(b)) = (&c.slots[0], &c.slots[1]) else {
+            let mut remove = None;
+            for (i, name) in ["A", "B"].into_iter().enumerate() {
+                if ui.horizontal(|ui| slot_label(ui, name, c.slots[i].as_ref())).inner {
+                    remove = Some(i);
+                }
+            }
+            if let Some(i) = remove {
+                c.slots[i] = None;
+            }
             ui.centered_and_justified(|ui| {
                 ui.label(
                     RichText::new("History・サイトマップ・検出の一覧で右クリック →「Comparer に送る」で、比べる通信を 2 件選んでください")
@@ -227,17 +216,19 @@ impl PxApp {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let text_color = ui.visuals().text_color();
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace) + 4.0;
+        // A / B の境目（左の本文と右の行番号の間）をつまみにして幅を変えられるようにする
+        let area = ui.available_rect_before_wrap();
+        let split = Split::new(ui, "comparer", area);
         let spacing = ui.spacing().item_spacing.x;
         let no_w = 48.0;
-        let text_w = ((ui.available_width() - 2.0 * no_w - 3.0 * spacing) / 2.0).max(80.0);
         let mut table = TableBuilder::new(ui)
             .id_salt("comparer")
             .striped(false)
             .cell_layout(Layout::left_to_right(Align::Center))
             .column(Column::exact(no_w))
-            .column(Column::exact(text_w).clip(true))
+            .column(Column::exact((split.left_width() - no_w - spacing).max(1.0)).clip(true))
             .column(Column::exact(no_w))
-            .column(Column::exact(text_w).clip(true));
+            .column(Column::exact((split.right_width() - no_w - spacing).max(1.0)).clip(true));
         if let Some(row) = c.scroll_to.take() {
             table = table.scroll_to_row(row, Some(Align::Center));
         }
@@ -254,12 +245,14 @@ impl PxApp {
                 }
             }
         };
+        let mut remove = None;
         table
             .header(row_h, |mut h| {
-                for (t, label) in [("", ""), ("A", &a.label), ("", ""), ("B", &b.label)] {
+                for (i, (name, item)) in [("A", a), ("B", b)].into_iter().enumerate() {
+                    h.col(|_| {});
                     h.col(|ui| {
-                        if !t.is_empty() {
-                            ui.add(egui::Label::new(RichText::new(format!("{t}: {label}")).strong()).truncate());
+                        if slot_label(ui, name, Some(item)) {
+                            remove = Some(i);
                         }
                     });
                 }
@@ -277,7 +270,24 @@ impl PxApp {
                     }
                 });
             });
+        split.handle(ui, area.bottom());
+        if let Some(i) = remove {
+            c.slots[i] = None;
+            c.diff = None;
+        }
     }
+}
+
+/// A / B の欄の見出し。長い説明は省略してホバーで全体を出す。「×」が押されたら true。
+fn slot_label(ui: &mut egui::Ui, name: &str, item: Option<&CompareItem>) -> bool {
+    ui.label(RichText::new(name).strong());
+    let Some(item) = item else {
+        ui.label(RichText::new("（未設定）").weak());
+        return false;
+    };
+    let remove = ui.small_button("×").on_hover_text("外す").clicked();
+    ui.add(egui::Label::new(RichText::new(&item.label).monospace()).truncate()).on_hover_text(&item.label);
+    remove
 }
 
 #[cfg(test)]

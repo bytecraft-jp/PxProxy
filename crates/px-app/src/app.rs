@@ -13,6 +13,7 @@ mod repeater_tab;
 mod rows;
 mod settings_tab;
 mod sitemap_tab;
+mod split;
 #[cfg(test)]
 mod smoke_tests;
 mod style;

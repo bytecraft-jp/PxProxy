@@ -7,6 +7,7 @@ use egui::{Align, Color32, Key, KeyboardShortcut, Layout, Modifiers, RichText};
 use egui_extras::{Column, TableBuilder};
 use px_store::{Finding, FlowSummary, Reader, WsMessage};
 
+use super::split;
 use super::style::{GREEN, severity_color, yellow};
 use super::PxApp;
 use crate::codec::{self, Output};
@@ -354,7 +355,7 @@ impl PxApp {
         };
         let mut open_codec = false;
 
-        ui.columns(2, |cols| {
+        split::columns(ui, "detail", |cols| {
             for (i, (ui, title)) in cols.iter_mut().zip(["Request", "Response"]).enumerate() {
                 ui.horizontal(|ui| {
                     ui.strong(title);
@@ -712,7 +713,7 @@ fn ws_pane(ui: &mut egui::Ui, ws: &mut WsView, selection: &mut Option<Selection>
     }
     let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
     let mut clicked = None;
-    ui.columns(2, |cols| {
+    split::columns(ui, "ws", |cols| {
         let ui = &mut cols[0];
         ui.horizontal(|ui| {
             ui.strong(format!("メッセージ {} 件", ws.messages.len()));

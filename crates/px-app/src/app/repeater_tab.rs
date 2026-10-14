@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 
 use super::detail::{EditTarget, ViewMode, image_view, selection_menu, show_keeping_selection};
 use super::intercept_tab::split_head_body;
+use super::split;
 use super::style::{RED, status_color};
 use super::{PxApp, Tab};
 use crate::highlight::{self, Theme};
@@ -383,7 +384,7 @@ impl PxApp {
         let waiting = tab.pending.is_some() && tab.cursor + 1 == n;
         let selection = &mut self.selection;
         let mut open_codec = false;
-        ui.columns(2, |cols| {
+        split::columns(ui, "repeater", |cols| {
             cols[0].strong("Request");
             if let Some(b) = &tab.binary_body {
                 cols[0].label(
