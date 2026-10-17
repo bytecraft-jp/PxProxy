@@ -5,6 +5,8 @@
 ブラウザなどの HTTP / HTTPS 通信を手元で中継・記録し、閲覧・編集・再送できる診断用プロキシです。
 GUI アプリ（`pxproxy`）と、GUI なしで動くコマンド（`pxproxy-cli`）があります。
 
+![History: 記録した通信の一覧と、選んだ通信の Request / Response](docs/images/history.png)
+
 ## 特徴
 
 - **HTTPS を復号して記録**: ローカル CA が接続先ごとに証明書を発行し、通信内容をそのまま確認できます。
@@ -16,6 +18,18 @@ GUI アプリ（`pxproxy`）と、GUI なしで動くコマンド（`pxproxy-cli
   - Body は読んだそばからクライアントへ流します（Intercept で止める通信を除く）。大きなダウンロードや SSE も溜めずに届きます。
   - SQLite（WAL）にメタデータを保存します。大きな Body は blake3 で重複を除いたうえで zstd 圧縮して保存します。
 - **案件単位で管理**: 1 案件 = 1 フォルダ。zip にまとめて受け渡しできます。
+
+## 画面イメージ
+
+冒頭の画像は History（記録した通信の一覧と詳細）です。画面に写っている通信は、すべて架空のものです。
+
+**検出**: 記録した通信のパッシブチェック。選んだ検出に該当する通信と、その詳細を表示します
+
+![検出](docs/images/findings.png)
+
+**Comparer**: 2 つの通信を左右に並べて、行と単語の単位で差分を表示します
+
+![Comparer](docs/images/comparer.png)
 
 ## 機能
 
@@ -175,4 +189,10 @@ zip のエクスポート / インポートはバックグラウンドで実行�
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets
+```
+
+README の画面イメージ（`docs/images/`）は、架空の通信を記録した案件を描画して作ります。画面を変えたら作り直してください。
+
+```sh
+cargo test -p px-app readme_screenshots -- --ignored
 ```

@@ -16,6 +16,8 @@ mod sitemap_tab;
 mod split;
 #[cfg(test)]
 mod smoke_tests;
+#[cfg(test)]
+mod screenshots;
 mod style;
 mod tasks;
 

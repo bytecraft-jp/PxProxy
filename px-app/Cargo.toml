@@ -34,7 +34,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 brotli = "9.0.0"
-egui_kittest = { version = "0.36.2", features = ["eframe"] }
+egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
 tempfile = "3.27.0"
 
 [build-dependencies]
