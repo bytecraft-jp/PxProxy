@@ -156,10 +156,10 @@ zip のエクスポート / インポートはバックグラウンドで実行�
 
 | クレート | 役割 |
 |---|---|
-| `crates/px-proxy` | MITM プロキシ本体（HTTP/1.x、TLS、CA、Intercept、Repeater の送信） |
-| `crates/px-store` | 案件の保存（SQLite + Body ストア、zip の入出力） |
-| `crates/px-app` | GUI（egui / eframe）。バイナリ名は `pxproxy` |
-| `crates/px-cli` | GUI なしのコマンド。バイナリ名は `pxproxy-cli` |
+| `px-proxy` | MITM プロキシ本体（HTTP/1.x、TLS、CA、Intercept、Repeater の送信） |
+| `px-store` | 案件の保存（SQLite + Body ストア、zip の入出力） |
+| `px-app` | GUI（egui / eframe）。バイナリ名は `pxproxy` |
+| `px-cli` | GUI なしのコマンド。バイナリ名は `pxproxy-cli` |
 
 ## 制限事項
 

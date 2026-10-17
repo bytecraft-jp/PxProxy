@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/px-store", "crates/px-proxy", "crates/px-app", "crates/px-cli"]
+members = ["px-store", "px-proxy", "px-app", "px-cli"]
 
 [profile.release]
 lto = "thin"
